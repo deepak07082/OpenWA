@@ -108,6 +108,9 @@ export function Chats() {
   const [chats, setChats] = useState<Chat[]>([]);
   const [loadingChats, setLoadingChats] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
+  // DB-enriched metadata (chatId → {chatName, chatPhone, lastMessageType}) for resolving @lid / unnamed chats and media snippets
+  const dbChatMetaRef = useRef<Map<string, { chatName: string | null; chatPhone: string | null; lastMessageType: string | null }>>(new Map());
+
 
   // Selected chat & message history
   const [activeChat, setActiveChat] = useState<Chat | null>(null);
@@ -160,7 +163,16 @@ export function Chats() {
       if (!sessionId) return;
       try {
         setLoadingChats(true);
-        const data = await sessionApi.getChats(sessionId);
+        // Fetch live chats and DB metadata in parallel; DB metadata resolves @lid → phone number
+        const [data, dbChats] = await Promise.all([
+          sessionApi.getChats(sessionId),
+          sessionApi.getDbChats(sessionId).catch(() => []),
+        ]);
+        const metaMap = new Map<string, { chatName: string | null; chatPhone: string | null; lastMessageType: string | null }>();
+        for (const dc of dbChats) {
+          metaMap.set(dc.chatId, { chatName: dc.chatName, chatPhone: dc.chatPhone, lastMessageType: dc.lastMessageType });
+        }
+        dbChatMetaRef.current = metaMap;
         const sorted = [...data].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
         setChats(sorted);
       } catch (err) {
@@ -597,7 +609,40 @@ export function Chats() {
     return new Date(timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
-  const formatLastMessageSnippet = (chat: Chat) => chat.lastMessage || '';
+
+  const chatDisplayName = (chat: Chat): string => {
+    const name = chat.name?.trim();
+    // Use the name only when it's a real display name (not a raw JID like "xxx@g.us")
+    if (name && !name.includes('@')) return name;
+    // Fall back to DB-stored contact name / phone (resolves @lid and unnamed contacts)
+    const meta = dbChatMetaRef.current.get(chat.id);
+    if (meta?.chatName) return meta.chatName;
+    if (meta?.chatPhone) return meta.chatPhone;
+    if (chat.isGroup) {
+      const groupNum = chat.id.split('@')[0];
+      return `Group · ${groupNum.slice(-6)}`;
+    }
+    if (chat.id.endsWith('@lid')) {
+      return `Contact · ${chat.id.split('@')[0].slice(-6)}`;
+    }
+    // For individual chats the JID prefix is the phone number (e.g. 919876543210@c.us)
+    return chat.id.split('@')[0];
+  };
+
+  const mediaTypeLabels: Record<string, string> = {
+    image: '📷 Photo', video: '🎥 Video', audio: '🎵 Audio',
+    voice: '🎤 Voice note', document: '📄 Document',
+    sticker: '🩷 Sticker', location: '📍 Location',
+    contact: '👤 Contact', revoked: '🚫 Deleted message',
+  };
+
+  const formatLastMessageSnippet = (chat: Chat): string => {
+    if (chat.lastMessage?.trim()) return chat.lastMessage;
+    const meta = dbChatMetaRef.current.get(chat.id);
+    const type = meta?.lastMessageType;
+    if (type && type !== 'text') return mediaTypeLabels[type] ?? `📎 ${type}`;
+    return '';
+  };
 
   const formatChatTime = (timestamp?: number) => {
     if (!timestamp) return '';
@@ -711,8 +756,8 @@ export function Chats() {
 
                       <div className="chat-item-info">
                         <div className="chat-item-top">
-                          <span className="chat-item-name" title={chat.name || chat.id}>
-                            {chat.name || chat.id.split('@')[0]}
+                          <span className="chat-item-name" title={chatDisplayName(chat)}>
+                            {chatDisplayName(chat)}
                           </span>
                           {chat.timestamp && (
                             <span className="chat-item-time">{formatChatTime(chat.timestamp)}</span>
@@ -749,8 +794,14 @@ export function Chats() {
                     {activeChat.isGroup ? <Users size={20} /> : <User size={20} />}
                   </div>
                   <div className="room-contact-info">
-                    <h3>{activeChat.name || activeChat.id.split('@')[0]}</h3>
-                    <span>{activeChat.id}</span>
+                    <h3>{chatDisplayName(activeChat)}</h3>
+                    <span>{
+                      (() => {
+                        if (activeChat.isGroup) return activeChat.id;
+                        const meta = dbChatMetaRef.current.get(activeChat.id);
+                        return meta?.chatPhone ?? meta?.chatName ?? activeChat.id.split('@')[0];
+                      })()
+                    }</span>
                   </div>
                 </header>
 
@@ -986,7 +1037,7 @@ export function Chats() {
                           name:
                             replyingTo.direction === 'outgoing'
                               ? t('chats.you')
-                              : activeChat.name || activeChat.id.split('@')[0],
+                              : chatDisplayName(activeChat),
                         })}
                       </div>
                       <div className="replying-to-body">

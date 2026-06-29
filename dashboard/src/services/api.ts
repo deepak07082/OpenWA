@@ -156,6 +156,14 @@ export interface ChatMessage {
   chatId: string;
   from: string;
   to: string;
+  /** Plain phone number (digits) of the sender — snapshotted at save time. */
+  senderPhone?: string | null;
+  /** Display name / pushName of the sender — snapshotted at save time. */
+  senderName?: string | null;
+  /** Session phone number snapshotted when the message was stored. */
+  sessionPhone?: string | null;
+  /** Session WhatsApp display name snapshotted when the message was stored. */
+  sessionPushName?: string | null;
   body: string;
   type: MessageType;
   direction: 'incoming' | 'outgoing';
@@ -319,7 +327,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
       window.location.assign('/');
       // The page is navigating away — halt this request's promise chain so callers neither
       // throw the generic error below (flashing a toast) nor receive an undefined payload.
-      return new Promise<T>(() => {});
+      return new Promise<T>(() => { });
     }
   }
 
@@ -349,7 +357,7 @@ async function requestText(endpoint: string): Promise<string> {
     sessionStorage.removeItem('openwa_api_key');
     if (typeof window !== 'undefined') {
       window.location.assign('/');
-      return new Promise<string>(() => {});
+      return new Promise<string>(() => { });
     }
   }
 
@@ -382,6 +390,18 @@ export const sessionApi = {
   getGroups: (id: string) =>
     request<{ id: string; name: string; linkedParentJID?: string | null }[]>(`/sessions/${id}/groups`),
   getChats: (id: string) => request<Chat[]>(`/sessions/${id}/chats`),
+  getDbChats: (id: string) =>
+    request<{
+      chatId: string;
+      lastMessage: string | null;
+      lastMessageType: string | null;
+      lastTimestamp: number | null;
+      messageCount: number;
+      chatName: string | null;
+      chatPhone: string | null;
+    }[]>(
+      `/sessions/${id}/messages/chats`,
+    ),
   markChatRead: (id: string, chatId: string) =>
     request<{ success: boolean }>(`/sessions/${id}/chats/read`, {
       method: 'POST',
@@ -402,8 +422,7 @@ export const sessionApi = {
   // video/voice render instead of collapsing to an empty timestamp-only bubble.
   getChatHistory: (id: string, chatId: string, limit = 100, includeMedia = false) =>
     request<EngineHistoryMessage[]>(
-      `/sessions/${id}/messages/${encodeURIComponent(chatId)}/history?limit=${limit}${
-        includeMedia ? '&includeMedia=true' : ''
+      `/sessions/${id}/messages/${encodeURIComponent(chatId)}/history?limit=${limit}${includeMedia ? '&includeMedia=true' : ''
       }`,
     ),
 };

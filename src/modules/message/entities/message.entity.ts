@@ -57,6 +57,22 @@ export class Message {
   @Column()
   to: string;
 
+  /** Plain phone number (digits only) of whoever sent this message. For outgoing messages this is the session phone. */
+  @Column({ type: 'varchar', length: 30, nullable: true })
+  senderPhone: string | null;
+
+  /** Display name (pushName / saved contact name) of the sender. Snapshotted at save time so it survives session deletion. */
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  senderName: string | null;
+
+  /** Session phone number snapshotted when the message was stored. Survives session deletion. */
+  @Column({ type: 'varchar', length: 30, nullable: true })
+  sessionPhone: string | null;
+
+  /** Session WhatsApp display name (pushName) snapshotted when the message was stored. */
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  sessionPushName: string | null;
+
   @Column({ type: 'text', nullable: true })
   body: string;
 

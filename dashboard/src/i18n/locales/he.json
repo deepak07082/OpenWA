@@ -74,7 +74,8 @@
     "messageTester": "בדיקת הודעות",
     "infrastructure": "תשתית",
     "plugins": "תוספים",
-    "logs": "לוגים"
+    "logs": "לוגים",
+    "history": "Chat History"
   },
   "chats": {
     "subtitle": "שליחה ומענה להודעות WhatsApp בזמן אמת",

@@ -74,6 +74,7 @@
     "infrastructure": "Infraestructura",
     "plugins": "Plugins",
     "logs": "Registros",
+    "history": "Chat History",
     "templates": "Plantillas"
   },
   "chats": {

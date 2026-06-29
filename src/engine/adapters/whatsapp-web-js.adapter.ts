@@ -419,7 +419,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       }
     });
 
-    this.client.on('message_create', msg => {
+    this.client.on('message_create', async msg => {
       // `message_create` fires for every message the account creates — including ones composed on a
       // linked phone, which the `message` event above never delivers. Incoming messages are already
       // handled there, so forward only the account's own outgoing (`fromMe`) messages; this is the
@@ -429,7 +429,26 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       }
 
       try {
-        this.callbacks.onMessageCreate?.(buildIncomingMessageBase(msg));
+        const outgoingMessage = buildIncomingMessageBase(msg);
+
+        // Download media for outgoing messages (stickers, images, etc.) so the
+        // chat history page can render the actual content, not just a type label.
+        if (msg.hasMedia) {
+          try {
+            const media = await msg.downloadMedia();
+            if (media) {
+              outgoingMessage.media = {
+                mimetype: media.mimetype,
+                filename: media.filename || undefined,
+                data: media.data,
+              };
+            }
+          } catch (mediaErr) {
+            this.logger.error('Error downloading outgoing message media', String(mediaErr));
+          }
+        }
+
+        this.callbacks.onMessageCreate?.(outgoingMessage);
       } catch (error) {
         this.logger.error('Error processing outgoing message', String(error));
       }
@@ -522,9 +541,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       if (Date.now() - this.readyReconcileStartedAt >= READY_RECONCILE_TIMEOUT_MS) {
         this.logger.warn(
           'Timed out waiting for WhatsApp Web runtime readiness after authentication — the saved session ' +
-            'is stuck after the QR scan (usually the auto-selected WhatsApp Web build is incompatible). ' +
-            'Clearing it to re-pair; pin a known-good version via WWEBJS_WEB_VERSION (see ' +
-            'docs/12-troubleshooting-faq.md) if it keeps recurring.',
+          'is stuck after the QR scan (usually the auto-selected WhatsApp Web build is incompatible). ' +
+          'Clearing it to re-pair; pin a known-good version via WWEBJS_WEB_VERSION (see ' +
+          'docs/12-troubleshooting-faq.md) if it keeps recurring.',
         );
         this.clearReadyReconcile();
         // Self-heal: don't leave the session stuck at "authenticating" forever — clear the broken auth
@@ -747,7 +766,15 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async sendTextMessage(chatId: string, text: string): Promise<MessageResult> {
     this.ensureReady();
-    const msg = await this.client!.sendMessage(chatId, text);
+    let msg: Awaited<ReturnType<Client['sendMessage']>>;
+    try {
+      msg = await this.client!.sendMessage(chatId, text);
+    } catch (error) {
+      this.handleClientError(error);
+    }
+    if (!msg) {
+      throw new Error(`Chat not found or message not delivered for chatId: ${chatId}`);
+    }
     return {
       id: msg.id._serialized,
       timestamp: msg.timestamp,
@@ -788,9 +815,17 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
     }
 
-    const msg = await this.client!.sendMessage(chatId, messageMedia, {
-      caption: media.caption,
-    });
+    let msg: Awaited<ReturnType<Client['sendMessage']>>;
+    try {
+      msg = await this.client!.sendMessage(chatId, messageMedia, {
+        caption: media.caption,
+      });
+    } catch (error) {
+      this.handleClientError(error);
+    }
+    if (!msg) {
+      throw new Error(`Chat not found or message not delivered for chatId: ${chatId}`);
+    }
 
     return {
       id: msg.id._serialized,
@@ -1563,5 +1598,39 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // disconnected / reconnecting / still initializing (#100).
       throw new EngineNotReadyError();
     }
+  }
+
+
+  /**
+   * Detects errors that indicate the Puppeteer page context has been destroyed or
+   * the WhatsApp Web page has reloaded (window.WWebJS becomes undefined). When this
+   * happens the status must be downgraded so ensureReady() blocks subsequent calls
+   * and the session manager can trigger a reconnect.
+   */
+  private handleClientError(error: unknown): never {
+    if (error instanceof Error) {
+      const msg = error.message ?? '';
+      const isBrokenPage =
+        // window.WWebJS wiped after page reload
+        (error instanceof TypeError && (
+          msg.includes('Cannot read properties of undefined') ||
+          msg.includes('Cannot read property') ||
+          msg.includes('getChat') ||
+          msg.includes('sendMessage') ||
+          msg.includes('WWebJS')
+        )) ||
+        // Puppeteer browser/target closed
+        msg.includes('Target closed') ||
+        msg.includes('Protocol error') ||
+        msg.includes('Session closed') ||
+        msg.includes('TargetCloseError') ||
+        error.constructor?.name === 'TargetCloseError';
+
+      if (isBrokenPage) {
+        this.setStatus(EngineStatus.DISCONNECTED);
+        throw new EngineNotReadyError();
+      }
+    }
+    throw error;
   }
 }

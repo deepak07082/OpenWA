@@ -133,7 +133,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     private readonly eventsGateway: EventsGateway,
     private readonly webhookService: WebhookService,
     private readonly hookManager: HookManager,
-  ) {}
+  ) { }
 
   /**
    * On backend startup, reset all active session statuses to disconnected
@@ -591,6 +591,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           connectedAt: new Date(),
           lastActiveAt: new Date(),
         });
+
+        // Pull any messages sent/received while the session was offline.
+        // Runs in the background — errors are logged but never block readiness.
+        void this.syncMissedMessages(id, engine, phone, pushName);
       },
       onMessage: (message): void => {
         if (!this.isLiveEngine(id, engine)) return;
@@ -625,10 +629,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             // Persist the incoming message so the dashboard chats view can render history.
             const incoming: IncomingMessage = finalMessage;
 
-            // Inline @lid -> phone resolution (#263), opt-in via RESOLVE_LID_TO_PHONE. Best-effort:
-            // attaches senderPhone (digits or null) before persist/dispatch so webhook/ws consumers
-            // get it in a single pass. Only for privacy-id senders, so no lookup for normal numbers.
-            if (process.env.RESOLVE_LID_TO_PHONE === 'true' && incoming.isLidSender && !incoming.fromMe) {
+            // Always resolve @lid -> real phone number (cached, best-effort). @lid is a WhatsApp
+            // privacy identifier — its numeric prefix is NOT a phone number and must not be stored as one.
+            if (incoming.isLidSender && !incoming.fromMe) {
               incoming.senderPhone = await this.resolveSenderPhone(id, incoming.author ?? incoming.from);
             }
 
@@ -640,12 +643,37 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
               metadata.quotedMessage = incoming.quotedMessage;
             }
 
+            // Snapshot session identity so history survives session deletion.
+            const sessionPhone = engine.getPhoneNumber();
+            const sessionPushName = engine.getPushName();
+
+            // Resolve sender phone: prefer the already-resolved senderPhone.
+            // For @lid senders without a resolved phone, store null — the LID numeric prefix is not a phone number.
+            const rawSenderJid = incoming.author ?? incoming.from;
+            const isLidJid = rawSenderJid?.endsWith('@lid') ?? false;
+            const resolvedSenderPhone: string | null =
+              incoming.senderPhone ?? (isLidJid ? null : rawSenderJid ? rawSenderJid.split('@')[0] : null);
+
+            // Sender display name from the contact cache (best-effort).
+            const resolvedSenderName: string | null =
+              incoming.contact?.name ?? incoming.contact?.pushName ?? null;
+
+            // Skip duplicate — message_create also fires for incoming during history sync.
+            if (incoming.id) {
+              const exists = await this.messageRepository.existsBy({ sessionId: id, waMessageId: incoming.id });
+              if (exists) return;
+            }
+
             const dbMessage = this.messageRepository.create({
               sessionId: id,
               waMessageId: incoming.id,
               chatId: incoming.chatId,
               from: incoming.from,
               to: incoming.to,
+              senderPhone: resolvedSenderPhone,
+              senderName: resolvedSenderName,
+              sessionPhone,
+              sessionPushName,
               body: incoming.body,
               type: incoming.type,
               direction: incoming.fromMe ? MessageDirection.OUTGOING : MessageDirection.INCOMING,
@@ -718,18 +746,53 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             sessionId: id,
             source: 'Engine',
           })
-          .then(({ continue: shouldContinue, data: finalMessage }) => {
+          .then(async ({ continue: shouldContinue, data: finalMessage }) => {
             if (!shouldContinue) {
               return;
             }
 
-            // NOTE: unlike onMessage (incoming), this path intentionally does NOT mirror the message
-            // to the `messages` table. message_create ALSO fires for API-originated sends, which the
-            // REST send path already persists — saving here would double-persist them. Safe
-            // persistence of phone-composed sends needs a unique (sessionId, waMessageId) index +
-            // de-dup and is tracked as a separate enhancement; until then this path only webhooks/
-            // emits. So local message history reflects API sends + all inbound, but not sends
-            // composed on a linked phone.
+            // Persist phone-sent messages (composed on the linked device, not via this API).
+            // API-sent messages are already saved by saveOutgoingMessage() + post-send UPDATE,
+            // so skip if a row with this waMessageId already exists in this session.
+            const outgoing: IncomingMessage = finalMessage;
+            const alreadySaved = outgoing.id
+              ? await this.messageRepository.existsBy({ sessionId: id, waMessageId: outgoing.id })
+              : false;
+
+            if (!alreadySaved) {
+              const sessionPhone = engine.getPhoneNumber();
+              const sessionPushName = engine.getPushName();
+              const phoneMeta: Record<string, unknown> = {};
+              if (outgoing.media) phoneMeta.media = outgoing.media;
+              if (outgoing.quotedMessage) phoneMeta.quotedMessage = outgoing.quotedMessage;
+
+              const dbMsg = this.messageRepository.create({
+                sessionId: id,
+                waMessageId: outgoing.id,
+                chatId: outgoing.chatId,
+                from: outgoing.from,
+                to: outgoing.to,
+                senderPhone: sessionPhone,
+                senderName: sessionPushName,
+                sessionPhone,
+                sessionPushName,
+                body: outgoing.body,
+                type: outgoing.type,
+                direction: MessageDirection.OUTGOING,
+                timestamp: outgoing.timestamp,
+                status: MessageStatus.SENT,
+                metadata: Object.keys(phoneMeta).length > 0 ? phoneMeta : undefined,
+              });
+
+              await this.messageRepository.save(dbMsg).catch(err => {
+                this.logger.error(`Failed to save phone-sent message ${outgoing.id} to database`, String(err), {
+                  sessionId: id,
+                  action: 'save_phone_sent_message',
+                });
+              });
+            }
+
+            // Dispatch to webhooks with potentially modified message
             void this.webhookService.dispatch(id, 'message.sent', finalMessage);
             // Emit real-time event to WebSocket clients (as message.sent, not message.received)
             this.eventsGateway.emitMessageSent(id, finalMessage);
@@ -937,7 +1000,127 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
         void this.updateStatus(id, SessionStatus.FAILED);
       },
+    }).catch((err: unknown) => {
+      // engine.initialize() already called onError and set itself to FAILED before
+      // re-throwing. Swallow the re-throw here so it doesn't surface as a 500.
+      const reason = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Engine initialization threw after onError: ${reason}`, undefined, {
+        sessionId: id,
+        action: 'engine_init_throw',
+      });
     });
+  }
+
+
+  /**
+   * After reconnect, fetch recent messages from every WA chat and persist any
+   * that aren't already in the database (sent/received while offline).
+   * Runs fully in the background — one failure per chat is logged and skipped.
+   */
+  private async syncMissedMessages(
+    sessionId: string,
+    engine: IWhatsAppEngine,
+    sessionPhone: string,
+    sessionPushName: string,
+  ): Promise<void> {
+    // Small delay so WA Web finishes its own internal history sync first.
+    await new Promise(resolve => setTimeout(resolve, 4000));
+
+    let chats: { id: string }[];
+    try {
+      chats = await engine.getChats();
+    } catch (err) {
+      this.logger.warn(`syncMissedMessages: failed to fetch chat list for ${sessionId}: ${String(err)}`);
+      return;
+    }
+
+    this.logger.log(`syncMissedMessages: syncing ${chats.length} chats for session ${sessionId}`);
+
+    // Cache contact name lookups within this sync run to avoid one call per message.
+    const contactNameCache = new Map<string, string | null>();
+    const resolveContactName = async (senderJid: string): Promise<string | null> => {
+      if (contactNameCache.has(senderJid)) return contactNameCache.get(senderJid) ?? null;
+      try {
+        const contact = await engine.getContactById(senderJid);
+        const name = contact?.name ?? contact?.pushName ?? null;
+        contactNameCache.set(senderJid, name);
+        return name;
+      } catch {
+        contactNameCache.set(senderJid, null);
+        return null;
+      }
+    };
+
+    for (const chat of chats) {
+      try {
+        const messages = await engine.getChatHistory(chat.id, 30, true);
+        for (const msg of messages) {
+          if (!msg.id) continue;
+          const exists = await this.messageRepository.existsBy({ sessionId, waMessageId: msg.id });
+          if (exists) continue;
+
+          const metadata: Record<string, unknown> = {};
+          if (msg.media) metadata.media = msg.media;
+          if (msg.quotedMessage) metadata.quotedMessage = msg.quotedMessage;
+
+          const rawSenderJid = msg.author ?? msg.from;
+          const isLidSyncJid = rawSenderJid?.endsWith('@lid') ?? false;
+          const senderPhone: string | null = msg.senderPhone ?? (isLidSyncJid ? null : rawSenderJid ? rawSenderJid.split('@')[0] : null);
+          // Prefer name from message payload; fall back to a cached contact lookup for sync messages
+          // (live incoming messages get async getContact() enrichment, but history fetch does not).
+          const senderName: string | null =
+            msg.contact?.name ?? msg.contact?.pushName ??
+            (rawSenderJid && !msg.fromMe ? await resolveContactName(rawSenderJid) : null);
+
+          const dbMsg = this.messageRepository.create({
+            sessionId,
+            waMessageId: msg.id,
+            chatId: msg.chatId,
+            from: msg.from,
+            to: msg.to,
+            senderPhone: msg.fromMe ? sessionPhone : senderPhone,
+            senderName: msg.fromMe ? sessionPushName : senderName,
+            sessionPhone,
+            sessionPushName,
+            body: msg.body,
+            type: msg.type,
+            direction: msg.fromMe ? MessageDirection.OUTGOING : MessageDirection.INCOMING,
+            timestamp: msg.timestamp,
+            status: MessageStatus.SENT,
+            metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+          });
+
+          await this.messageRepository.save(dbMsg).catch(err => {
+            this.logger.error(`syncMissedMessages: failed to save ${msg.id}`, String(err));
+          });
+        }
+
+        // Backfill senderName on existing rows for this chat that still have it null.
+        // This fixes historical records saved before the contact-name lookup was added.
+        const chatSenderJid = chat.id.endsWith('@g.us') ? null : chat.id;
+        if (chatSenderJid) {
+          const resolvedName = await resolveContactName(chatSenderJid);
+          if (resolvedName) {
+            await this.messageRepository
+              .createQueryBuilder()
+              .update()
+              .set({ senderName: resolvedName })
+              .where('sessionId = :sessionId', { sessionId })
+              .andWhere('chatId = :chatId', { chatId: chat.id })
+              .andWhere('direction = :dir', { dir: MessageDirection.INCOMING })
+              .andWhere('senderName IS NULL')
+              .execute()
+              .catch(err => {
+                this.logger.warn(`syncMissedMessages: backfill senderName failed for ${chat.id}: ${String(err)}`);
+              });
+          }
+        }
+      } catch (err) {
+        this.logger.warn(`syncMissedMessages: skipping chat ${chat.id}: ${String(err)}`);
+      }
+    }
+
+    this.logger.log(`syncMissedMessages: done for session ${sessionId}`);
   }
 
   /**

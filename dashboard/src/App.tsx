@@ -20,6 +20,7 @@ const Logs = lazy(() => import('./pages/Logs').then(m => ({ default: m.Logs })))
 const ApiKeys = lazy(() => import('./pages/ApiKeys').then(m => ({ default: m.ApiKeys })));
 const MessageTester = lazy(() => import('./pages/MessageTester').then(m => ({ default: m.MessageTester })));
 const Infrastructure = lazy(() => import('./pages/Infrastructure').then(m => ({ default: m.Infrastructure })));
+const ChatHistory = lazy(() => import('./pages/ChatHistory').then(m => ({ default: m.ChatHistory })));
 const Plugins = lazy(() => import('./pages/Plugins'));
 
 const queryClient = new QueryClient({
@@ -94,28 +95,33 @@ function AppContent() {
   );
 
   if (!isAuthenticated) {
-    return <Suspense fallback={loadingFallback}><Login onLogin={handleLogin} /></Suspense>;
+    return (
+      <Suspense fallback={loadingFallback}>
+        <Login onLogin={handleLogin} />
+      </Suspense>
+    );
   }
 
   return (
     <ToastProvider>
       <BrowserRouter>
         <Suspense fallback={loadingFallback}>
-        <Routes>
-          <Route path="/" element={<Layout onLogout={handleLogout} userRole={role} />}>
-            <Route index element={<Dashboard />} />
-            <Route path="sessions" element={<Sessions />} />
-            <Route path="chats" element={<Chats />} />
-            <Route path="webhooks" element={<Webhooks />} />
-            <Route path="templates" element={<Templates />} />
-            {role === 'admin' && <Route path="api-keys" element={<ApiKeys />} />}
-            <Route path="logs" element={<Logs />} />
-            <Route path="message-tester" element={<MessageTester />} />
-            <Route path="infrastructure" element={<Infrastructure />} />
-            {role === 'admin' && <Route path="plugins" element={<Plugins />} />}
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Route>
-        </Routes>
+          <Routes>
+            <Route path="/" element={<Layout onLogout={handleLogout} userRole={role} />}>
+              <Route index element={<Dashboard />} />
+              <Route path="sessions" element={<Sessions />} />
+              <Route path="chats" element={<Chats />} />
+              <Route path="history" element={<ChatHistory />} />
+              <Route path="webhooks" element={<Webhooks />} />
+              <Route path="templates" element={<Templates />} />
+              {role === 'admin' && <Route path="api-keys" element={<ApiKeys />} />}
+              <Route path="logs" element={<Logs />} />
+              <Route path="message-tester" element={<MessageTester />} />
+              <Route path="infrastructure" element={<Infrastructure />} />
+              {role === 'admin' && <Route path="plugins" element={<Plugins />} />}
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
+          </Routes>
         </Suspense>
       </BrowserRouter>
     </ToastProvider>

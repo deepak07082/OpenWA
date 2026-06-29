@@ -34,7 +34,7 @@ export class MessageService {
     private readonly hookManager: HookManager,
     private readonly templateService: TemplateService,
     private readonly lidMappingStore: LidMappingStoreService,
-  ) {}
+  ) { }
 
   async sendText(sessionId: string, dto: SendTextMessageDto): Promise<MessageResponseDto> {
     // Execute hook before sending - plugins can modify or block
@@ -252,6 +252,104 @@ export class MessageService {
     }
   }
 
+  async getChatsFromDb(
+    sessionId: string,
+  ): Promise<{
+    chatId: string;
+    lastMessage: string | null;
+    lastMessageType: string | null;
+    lastTimestamp: number | null;
+    messageCount: number;
+    chatName: string | null;
+    chatPhone: string | null;
+  }[]> {
+    const rows = await this.messageRepository
+      .createQueryBuilder('m')
+      .select('m.chatId', 'chatId')
+      .addSelect('MAX(m.timestamp)', 'lastTimestamp')
+      .addSelect('COUNT(*)', 'messageCount')
+      // Body of the most recent message (may be null for media)
+      .addSelect(
+        subQuery =>
+          subQuery
+            .select('sub.body')
+            .from('messages', 'sub')
+            .where('sub.sessionId = m.sessionId')
+            .andWhere('sub.chatId = m.chatId')
+            .orderBy('sub.timestamp', 'DESC', 'NULLS LAST')
+            .addOrderBy('sub.createdAt', 'DESC')
+            .limit(1),
+        'lastMessage',
+      )
+      // Type of the most recent message (text / image / sticker / audio …)
+      .addSelect(
+        subQuery =>
+          subQuery
+            .select('sub.type')
+            .from('messages', 'sub')
+            .where('sub.sessionId = m.sessionId')
+            .andWhere('sub.chatId = m.chatId')
+            .orderBy('sub.timestamp', 'DESC', 'NULLS LAST')
+            .addOrderBy('sub.createdAt', 'DESC')
+            .limit(1),
+        'lastMessageType',
+      )
+      // Saved contact name from the most recent INCOMING message
+      .addSelect(
+        subQuery =>
+          subQuery
+            .select('sub.senderName')
+            .from('messages', 'sub')
+            .where('sub.sessionId = m.sessionId')
+            .andWhere('sub.chatId = m.chatId')
+            .andWhere("sub.direction = 'incoming'")
+            .andWhere('sub.senderName IS NOT NULL')
+            .orderBy('sub.createdAt', 'DESC')
+            .limit(1),
+        'chatName',
+      )
+      // Saved phone number from the most recent INCOMING message
+      .addSelect(
+        subQuery =>
+          subQuery
+            .select('sub.senderPhone')
+            .from('messages', 'sub')
+            .where('sub.sessionId = m.sessionId')
+            .andWhere('sub.chatId = m.chatId')
+            .andWhere("sub.direction = 'incoming'")
+            .andWhere('sub.senderPhone IS NOT NULL')
+            .orderBy('sub.createdAt', 'DESC')
+            .limit(1),
+        'chatPhone',
+      )
+      .where('m.sessionId = :sessionId', { sessionId })
+      .groupBy('m.sessionId')
+      .addGroupBy('m.chatId')
+      .orderBy('MAX(m.timestamp)', 'DESC', 'NULLS LAST')
+      .getRawMany<{
+        chatId: string;
+        lastTimestamp: string | null;
+        messageCount: string;
+        lastMessage: string | null;
+        lastMessageType: string | null;
+        chatName: string | null;
+        chatPhone: string | null;
+      }>();
+
+    return rows.map(row => ({
+      chatId: row.chatId,
+      lastMessage: row.lastMessage ?? null,
+      lastMessageType: row.lastMessageType ?? null,
+      lastTimestamp: row.lastTimestamp !== null && row.lastTimestamp !== undefined
+        ? (Number.isNaN(Number(row.lastTimestamp)) ? null : Number(row.lastTimestamp))
+        : null,
+      messageCount: Number(row.messageCount) || 0,
+      chatName: row.chatName ?? null,
+      chatPhone: row.chatPhone ?? null,
+    }));
+  }
+
+
   /**
    * Get message history for a session
    */
@@ -271,7 +369,8 @@ export class MessageService {
     const query = this.messageRepository
       .createQueryBuilder('message')
       .where('message.sessionId = :sessionId', { sessionId })
-      .orderBy('message.createdAt', 'DESC')
+      .orderBy('message.timestamp', 'DESC', 'NULLS LAST')
+      .addOrderBy('message.createdAt', 'DESC')
       .skip(offset)
       .take(limit);
 
@@ -529,12 +628,19 @@ export class MessageService {
     },
   ): Promise<Message> {
     const session = await this.sessionService.findOne(sessionId);
+    const sessionPhone = session?.phone ?? null;
+    const sessionPushName = session?.pushName ?? null;
     const message = this.messageRepository.create({
       sessionId,
       waMessageId: data.waMessageId,
       chatId: data.chatId,
       from: session?.phone || 'me',
       to: data.chatId,
+      // For outgoing messages the session itself is the sender
+      senderPhone: sessionPhone,
+      senderName: sessionPushName,
+      sessionPhone,
+      sessionPushName,
       body: data.body,
       type: data.type,
       direction: MessageDirection.OUTGOING,

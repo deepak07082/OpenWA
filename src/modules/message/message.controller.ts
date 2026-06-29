@@ -22,7 +22,7 @@ export class MessageController {
   constructor(
     private readonly messageService: MessageService,
     private readonly bulkMessageService: BulkMessageService,
-  ) {}
+  ) { }
 
   @Get()
   @ApiOperation({ summary: 'Get message history for a session' })
@@ -261,6 +261,14 @@ export class MessageController {
   async react(@Param('sessionId') sessionId: string, @Body() dto: ReactMessageDto): Promise<{ success: boolean }> {
     await this.messageService.reactToMessage(sessionId, dto);
     return { success: true };
+  }
+
+  @Get('chats')
+  @ApiOperation({ summary: 'List distinct chats for a session from DB (no live engine required)' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'List of chats with last message and count' })
+  async getChatsFromDb(@Param('sessionId') sessionId: string) {
+    return this.messageService.getChatsFromDb(sessionId);
   }
 
   @Get(':chatId/history')
