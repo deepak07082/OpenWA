@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Eye, EyeOff, Languages } from 'lucide-react';
+import { Eye, EyeOff } from 'lucide-react';
 // import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
 import { API_BASE_URL } from '../services/api';
 import './Login.css';
@@ -10,7 +10,7 @@ interface LoginProps {
 }
 
 export function Login({ onLogin }: LoginProps) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
