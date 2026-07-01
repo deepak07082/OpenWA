@@ -125,6 +125,7 @@ All media send routes (`send-image`, `send-video`, `send-audio`, `send-document`
 | `mimetype` | string | conditional | required when `base64` is used | MIME type, e.g. `image/jpeg`, `video/mp4`, `application/pdf` |
 | `filename` | string | no | max 255 chars | Optional file name (also used as the persisted body fallback for documents) |
 | `caption` | string | no | max 1024 chars | Optional caption (not persisted for audio) |
+| `mentions` | string[] | no | array of WIDs | WIDs to @mention in the caption (e.g. `["62811@c.us"]`). See **Mentions** below |
 
 Provide **exactly one** of `url` or `base64`. Omitting both, or supplying `base64` without `mimetype`, returns `400`.
 
@@ -153,6 +154,15 @@ There is a **single shared media byte cap**, not a per-type table. A base64 (or 
 
 `send-text` enforces a maximum body length of **4096 characters** (`text` is `@MaxLength(4096)`). Media captions are limited to **1024 characters**.
 
+### Mentions
+
+`send-text` and the media send routes accept an optional `mentions` array of WIDs (`<phone>@c.us`) to tag participants — most useful in groups. Two things are required for WhatsApp to render a tag and notify the participant:
+
+1. The `mentions` array lists the WID(s), e.g. `["62811@c.us"]`.
+2. The `text`/`caption` contains the matching `@<number>` token, e.g. `Hello @62811`.
+
+The contract is engine-neutral: pass neutral `@c.us` WIDs and the active engine (whatsapp-web.js or Baileys) de-normalizes them internally. Whether a mention surfaces a notification is ultimately client-side — outside a shared group some clients may not render it.
+
 ## 6.4 REST API Reference
 
 Every path below is prefixed with `/api`. Unless marked **public**, send `X-API-Key: <key>`; `OPERATOR`/`ADMIN` annotations require a key of at least that role. Responses are the raw payload (no envelope); list endpoints return a bare array.
@@ -166,6 +176,13 @@ Base path `/api/sessions`. Read routes return data shaped by `SessionResponseDto
 List all sessions, scoped to the API key's `allowedSessions`, ordered `createdAt` DESC.
 
 **Auth:** API key  ·  **Scope:** session-scoped (a scoped key sees only its `allowedSessions`; an ADMIN / null-allowlist key lists all)
+
+**Query parameters**
+
+| Name | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `limit` | integer (1-1000) | No | `1000` | Max sessions to return; oversized/non-finite values are clamped/fallback to the default window. |
+| `offset` | integer | No | `0` | Sessions to skip for paging; negative/non-finite values resolve to `0`. |
 
 **Response** `200`
 
@@ -766,7 +783,7 @@ Returns a bare array of engine-neutral `IncomingMessage` objects:
 ]
 ```
 
-Each item may also include `isStatusBroadcast`, `mentionedIds`, `isLidSender`, `contact`, `media { mimetype, filename?, data?, omitted?, sizeBytes? }`, `quotedMessage { id, body }`, and `location { latitude, longitude, description?, address?, url? }`. `type` is one of `text|image|video|audio|voice|document|sticker|location|contact|revoked|unknown`.
+Each item may also include `isStatusBroadcast`, `mentionedIds`, `isLidSender`, `contact`, `media { mimetype, filename?, data?, omitted?, sizeBytes? }`, `quotedMessage { id, body }`, `call { video, missed }` (for `call` messages), and `location { latitude, longitude, description?, address?, url? }`. `type` is one of `text|image|video|audio|voice|document|sticker|location|contact|call|revoked|unknown`.
 
 **Errors:** `400` session not active · `401` missing/invalid API key · `500` engine error
 
@@ -857,9 +874,14 @@ Send a plain text message.
 | --- | --- | --- | --- | --- |
 | chatId | string | Yes | non-empty | `phone@c.us` or `groupId@g.us` |
 | text | string | Yes | non-empty, max 4096 | Message text |
+| mentions | string[] | No | array of WIDs | WIDs to @mention (e.g. `["62811@c.us"]`). See **Mentions** below |
 
 ```json
 { "chatId": "628123456789@c.us", "text": "Hello from OpenWA!" }
+```
+
+```json
+{ "chatId": "120363000000000000@g.us", "text": "Hello @62811", "mentions": ["62811@c.us"] }
 ```
 
 **Response** `201`
@@ -974,7 +996,7 @@ Send a video (by URL or base64) with an optional caption. Uses the same `SendMed
 
 #### POST /api/sessions/:sessionId/messages/send-audio
 
-Send an audio/voice message (by URL or base64). Uses `SendMediaMessageDto`. A `caption` is accepted by the DTO but not persisted for audio.
+Send an audio message (by URL or base64). Uses `SendAudioMessageDto`. A `caption` is accepted by the DTO but not persisted for audio. Set `ptt: true` to send a real WhatsApp **voice note** (microphone bubble + waveform) instead of a plain audio file. `ptt` is a JSON boolean, exclusive to this endpoint, and — because voice notes require `audio/ogg; codecs=opus` — the server defaults the mimetype to that when you set `ptt` without one; for reliable playback (especially on the Baileys engine, which does not transcode) supply OGG/Opus bytes. A `ptt` voice note is stored as message `type: "voice"`.
 
 **Auth:** API key (OPERATOR)
 
@@ -984,10 +1006,10 @@ Send an audio/voice message (by URL or base64). Uses `SendMediaMessageDto`. A `c
 | --- | --- | --- |
 | sessionId | string | Session ID |
 
-**Request body** — `SendMediaMessageDto` (fields `chatId`, `url`, `base64`, `mimetype`, `filename`, `caption` — see `send-image`)
+**Request body** — `SendAudioMessageDto` (all `SendMediaMessageDto` fields — `chatId`, `url`, `base64`, `mimetype`, `filename`, `caption` — plus optional `ptt` boolean)
 
 ```json
-{ "chatId": "628123456789@c.us", "url": "https://example.com/voice.ogg", "mimetype": "audio/ogg" }
+{ "chatId": "628123456789@c.us", "url": "https://example.com/voice.ogg", "mimetype": "audio/ogg", "ptt": true }
 ```
 
 **Response** `201`
@@ -2678,7 +2700,7 @@ Same `{ statuses }` wrapper and `Status` shape as the list-all route.
 
 #### POST /api/sessions/:sessionId/status/send-text
 
-Post a text status (story) to the session's status feed.
+Post a text status (story) to the session's status feed. **Baileys engine only** — a whatsapp-web.js session returns `501` (see Errors).
 
 **Auth:** API key (OPERATOR)
 
@@ -2693,11 +2715,12 @@ Post a text status (story) to the session's status feed.
 | Field | Type | Required | Constraints | Description |
 | --- | --- | --- | --- | --- |
 | text | string | yes | — | Status text body |
+| recipients | string[] | yes | 1–256 items, each matching `^\d+@(c\.us\|lid)$` | JIDs of the contacts permitted to view the status (passed as `statusJidList` to the engine). Empty array → `400` |
 | backgroundColor | string | no | 6-digit hex color matching `^#[0-9A-Fa-f]{6}$` | e.g. `#25D366`; bad value → `backgroundColor must be a hex color (e.g., #25D366)` |
-| font | integer | no | integer `0`–`4` | Font index |
+| font | integer | no | integer `0`–`5` | Font index |
 
 ```json
-{ "text": "Hello from OpenWA!", "backgroundColor": "#25D366", "font": 2 }
+{ "text": "Hello from OpenWA!", "recipients": ["6281234567890@c.us"], "backgroundColor": "#25D366", "font": 2 }
 ```
 
 **Response** `201`
@@ -2712,11 +2735,15 @@ Post a text status (story) to the session's status feed.
 
 Returns the engine `StatusResult` directly (no wrapper). POST default status is `201`.
 
-**Errors:** `400` validation failure (unknown body field, bad `backgroundColor`/`font`), or session is not started · `401` missing/invalid API key · `403` key lacks `OPERATOR` role · `404` session not found / not connected
+**Recipient JIDs:** `@c.us` (regular phone) recipients are reliable. `@lid` (privacy-id) recipients are best-effort and unverified — WhatsApp may not deliver to an unresolved LID, so prefer `@c.us` where the phone number is known.
+
+**Sender-side caveat:** the posting account's own phone may display a "waiting for this status update" notice in its status feed; this is cosmetic — recipients view the status normally.
+
+**Errors:** `400` validation failure (unknown body field, missing/empty `recipients`, a JID not matching `@c.us`/`@lid`, or more than 256 recipients, bad `backgroundColor`/`font`), or session is not started · `401` missing/invalid API key · `403` key lacks `OPERATOR` role · `404` session not found / not connected · `501` the session is on the whatsapp-web.js engine (status posting is Baileys-only; WA Web removed `WAWebStatusGatingUtils.canCheckStatusRankingPosterGating` around 2026-04-30, so the wwebjs path is upstream-blocked — see #455)
 
 #### POST /api/sessions/:sessionId/status/send-image
 
-Post an image status (story) from a URL or base64 payload.
+Post an image status (story) from a URL or base64 payload. **Baileys engine only** — a whatsapp-web.js session returns `501` (see Errors).
 
 **Auth:** API key (OPERATOR)
 
@@ -2733,12 +2760,14 @@ Post an image status (story) from a URL or base64 payload.
 | image | object (`MediaInput`) | yes | validated nested object (an empty `{}` passes — there is no `@IsNotEmpty`) | Media source wrapper |
 | image.url | string | no | — | Media source URL |
 | image.base64 | string | no | — | Base64-encoded media data |
+| image.mimetype | string | no | — | Media MIME type; if omitted the service defaults to `image/jpeg` |
+| recipients | string[] | yes | 1–256 items, each matching `^\d+@(c\.us\|lid)$` | JIDs of the contacts permitted to view the status (`statusJidList`). Empty array → `400` |
 | caption | string | no | — | Optional caption |
 
-The service resolves the media as `image.url || image.base64 || ''` and hard-codes mimetype `image/jpeg`.
+The service resolves the media as `image.url || image.base64 || ''` and applies mimetype `image.mimetype ?? 'image/jpeg'`.
 
 ```json
-{ "image": { "url": "https://example.com/photo.jpg" }, "caption": "My status" }
+{ "image": { "url": "https://example.com/photo.jpg", "mimetype": "image/png" }, "recipients": ["6281234567890@c.us"], "caption": "My status" }
 ```
 
 **Response** `201`
@@ -2753,11 +2782,13 @@ The service resolves the media as `image.url || image.base64 || ''` and hard-cod
 
 Returns the engine `StatusResult` directly. POST default status is `201`.
 
-**Errors:** `400` unknown top-level body field (strict whitelist), or session is not started · `401` missing/invalid API key · `403` key lacks `OPERATOR` role · `404` session not found / not connected
+**Recipient JIDs:** `@c.us` (regular phone) recipients are reliable. `@lid` (privacy-id) recipients are best-effort and unverified — prefer `@c.us` where the phone number is known. **Sender-side caveat:** the posting account's own phone may show a "waiting for this status update" notice; recipients view it normally.
+
+**Errors:** `400` validation failure (unknown body field, missing/empty `recipients`, a JID not matching `@c.us`/`@lid`, or more than 256 recipients), or session is not started · `401` missing/invalid API key · `403` key lacks `OPERATOR` role · `404` session not found / not connected · `501` the session is on the whatsapp-web.js engine (status posting is Baileys-only; see `send-text` and #455)
 
 #### POST /api/sessions/:sessionId/status/send-video
 
-Post a video status (story) from a URL or base64 payload.
+Post a video status (story) from a URL or base64 payload. **Baileys engine only** — a whatsapp-web.js session returns `501` (see Errors).
 
 **Auth:** API key (OPERATOR)
 
@@ -2774,12 +2805,14 @@ Post a video status (story) from a URL or base64 payload.
 | video | object (`MediaInput`) | yes | validated nested object (an empty `{}` passes) | Media source wrapper |
 | video.url | string | no | — | Media source URL |
 | video.base64 | string | no | — | Base64-encoded media data |
+| video.mimetype | string | no | — | Media MIME type; if omitted the service defaults to `video/mp4` |
+| recipients | string[] | yes | 1–256 items, each matching `^\d+@(c\.us\|lid)$` | JIDs of the contacts permitted to view the status (`statusJidList`). Empty array → `400` |
 | caption | string | no | — | Optional caption |
 
-The service resolves the media as `video.url || video.base64 || ''` and hard-codes mimetype `video/mp4`.
+The service resolves the media as `video.url || video.base64 || ''` and applies mimetype `video.mimetype ?? 'video/mp4'`.
 
 ```json
-{ "video": { "url": "https://example.com/clip.mp4" }, "caption": "Watch this" }
+{ "video": { "url": "https://example.com/clip.mp4", "mimetype": "video/quicktime" }, "recipients": ["6281234567890@c.us"], "caption": "Watch this" }
 ```
 
 **Response** `201`
@@ -2794,7 +2827,9 @@ The service resolves the media as `video.url || video.base64 || ''` and hard-cod
 
 Returns the engine `StatusResult` directly. POST default status is `201`.
 
-**Errors:** `400` unknown top-level body field, or session is not started · `401` missing/invalid API key · `403` key lacks `OPERATOR` role · `404` session not found / not connected
+**Recipient JIDs:** `@c.us` (regular phone) recipients are reliable. `@lid` (privacy-id) recipients are best-effort and unverified — prefer `@c.us` where the phone number is known. **Sender-side caveat:** the posting account's own phone may show a "waiting for this status update" notice; recipients view it normally.
+
+**Errors:** `400` validation failure (unknown body field, missing/empty `recipients`, a JID not matching `@c.us`/`@lid`, or more than 256 recipients), or session is not started · `401` missing/invalid API key · `403` key lacks `OPERATOR` role · `404` session not found / not connected · `501` the session is on the whatsapp-web.js engine (status posting is Baileys-only; see `send-text` and #455)
 
 #### DELETE /api/sessions/:sessionId/status/:statusId
 
@@ -2900,6 +2935,13 @@ List webhooks visible to the calling API key, scoped to its allowed sessions.
 
 **Auth:** API key (OPERATOR)  ·  **Scope:** session-scoped — derived from the authenticated key, not from any param/query
 
+**Query parameters**
+
+| Name | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `limit` | integer (1-1000) | No | `1000` | Max webhooks to return; oversized/non-finite values are clamped/fallback to the default window. |
+| `offset` | integer | No | `0` | Webhooks to skip for paging; negative/non-finite values resolve to `0`. |
+
 **Response** `200`
 
 ```json
@@ -2919,7 +2961,7 @@ List webhooks visible to the calling API key, scoped to its allowed sessions.
 ]
 ```
 
-Bare array, ordered by `createdAt` descending. If the calling key has a non-empty `allowedSessions` list, results are filtered to `WHERE sessionId IN (allowedSessions)`; a key with null/empty `allowedSessions` (e.g. an unrestricted ADMIN key) sees **all** webhooks. This is the cross-session list; the per-session list lives at `GET /api/sessions/:sessionId/webhooks`.
+Bare array, ordered by `createdAt` descending, bounded by `limit`/`offset`. If the calling key has a non-empty `allowedSessions` list, results are filtered to `WHERE sessionId IN (allowedSessions)`; a key with null/empty `allowedSessions` (e.g. an unrestricted ADMIN key) sees **all** webhooks. This is the cross-session list; the per-session list lives at `GET /api/sessions/:sessionId/webhooks`.
 
 **Errors:** `401` missing/invalid API key · `403` insufficient role
 
@@ -3517,7 +3559,7 @@ Notes: raw handler return. `session.status` is the `SessionStatus` enum value. `
 
 Get application settings (environment-derived; `general`/`api`/`notifications` groups).
 
-**Auth:** API key — any valid role (no `@RequireRole`).
+**Auth:** API key (ADMIN). Settings expose server configuration, so a VIEWER or session-scoped key is rejected with `403`.
 
 **Response** `200`
 
@@ -3544,7 +3586,7 @@ Get application settings (environment-derived; `general`/`api`/`notifications` g
 
 Notes: raw return of an in-memory `Settings` object built once in the controller constructor from `ConfigService` (snapshotted at construction, not re-read per request). `general.sessionTimeout` is `floor(webhook.timeout / 60000)` minutes; `api.rateLimitWindow` is in ms; `enableDocs`/`notifications.*` are partly hardcoded (`enableDocs: true`, `emailEnabled: false`, `notificationEmail: ''`, `webhookAlerts: true`).
 
-**Errors:** `401` — missing/invalid `X-API-Key`.
+**Errors:** `401` — missing/invalid `X-API-Key` · `403` — API key lacks the ADMIN role.
 
 #### PUT /api/settings
 
@@ -3604,7 +3646,6 @@ Aggregate infrastructure status (database, Redis, queue, storage, engine).
   "redis": { "enabled": false, "connected": false, "host": "localhost", "port": 6379 },
   "queue": {
     "enabled": false,
-    "messages": { "pending": 0, "completed": 0, "failed": 0 },
     "webhooks": { "pending": 0, "completed": 0, "failed": 0 }
   },
   "storage": { "type": "local", "path": "./data/media" },
@@ -3617,7 +3658,7 @@ Aggregate infrastructure status (database, Redis, queue, storage, engine).
 }
 ```
 
-The `queue.messages`/`queue.webhooks` counters are hardcoded to zeros (not live job counts); `redis.connected` is a live probe. `storage` only ever returns `type`+`path` here (no `bucket`).
+The `queue.webhooks` counters are live BullMQ job counts (`pending` = waiting + active + delayed; plus `completed`/`failed`), degrading to zeros when the queue is disabled or Redis is unreachable. `redis.connected` is a live probe. `storage` only ever returns `type`+`path` here (no `bucket`).
 
 **Errors:** `401` missing/invalid key · `403` key role < ADMIN
 
@@ -4485,6 +4526,8 @@ These are the events OpenWA actually emits. A webhook is registered with an `eve
 | `session.disconnected` | The session disconnects | `{ sessionId, reason }` |
 | `session.status` | The session status transitions | `{ sessionId, status }` where `status` is one of `created` / `initializing` / `qr_ready` / `authenticating` / `ready` / `disconnected` / `failed` |
 
+> **`STORE_EPHEMERAL_MESSAGES=false` affects `message.received`.** When `STORE_EPHEMERAL_MESSAGES` is set to `false`, incoming disappearing messages (those with `ephemeralDuration > 0`) are **not** persisted nor dispatched — no DB insert, no webhook delivery, and no websocket event. Downstream consumers and the dashboard both stop seeing them. Default is `true` (backward compatible — store and dispatch everything).
+
 > **Reserved but not emitted.** `group.join`, `group.leave`, and `group.update` are accepted in a webhook's `events` list (and have reserved idempotency-key formats), but **no code path currently emits them** — registering for them is harmless but they will never be delivered. Likewise there is **no** `contact.update` or `presence.update` event.
 
 ### Delivery semantics — at-least-once
@@ -4545,7 +4588,7 @@ Recurring lifecycle events (and `message.reaction`) carry the same content acros
 
 ### Retries with exponential backoff
 
-When the queue is enabled, a non-2xx response, timeout (`WEBHOOK_TIMEOUT`, default `10000` ms), or network error schedules a retry. The number of attempts comes from the webhook's `retryCount` (default `3`) and the delay grows **exponentially** from a base of `WEBHOOK_RETRY_DELAY` (default `5000` ms). Each retry reuses the same `idempotencyKey` and increments `X-OpenWA-Retry-Count`. When the queue is disabled, delivery is direct with the same retry budget applied inline.
+When the queue is enabled, a non-2xx response, timeout (`WEBHOOK_TIMEOUT`, default `10000` ms), or network error schedules a retry. The number of attempts comes from the webhook's `retryCount` (default `3`) and the delay grows **exponentially** from a base of `WEBHOOK_RETRY_DELAY` (default `5000` ms). Each retry reuses the same `idempotencyKey` and increments `X-OpenWA-Retry-Count`. If Redis/BullMQ rejects the initial enqueue, OpenWA logs a `webhook:error` hook event and falls back to direct delivery with the same inline retry budget. When the queue is disabled, delivery is direct with the same retry budget applied inline.
 
 ### SSRF guard on registration
 

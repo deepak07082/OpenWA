@@ -22,9 +22,9 @@ import { IWhatsAppEngine, MessageResult } from '../../engine/interfaces/whatsapp
 interface BulkMessageContent {
   text?: string;
   caption?: string;
-  image?: { url?: string; base64?: string; mimetype?: string };
-  video?: { url?: string; base64?: string; mimetype?: string };
-  audio?: { url?: string; base64?: string; mimetype?: string };
+  image?: { url?: string; base64?: string; mimetype?: string; filename?: string };
+  video?: { url?: string; base64?: string; mimetype?: string; filename?: string };
+  audio?: { url?: string; base64?: string; mimetype?: string; filename?: string; ptt?: boolean };
   document?: { url?: string; base64?: string; mimetype?: string; filename?: string };
 }
 
@@ -107,8 +107,10 @@ export class BulkMessageService implements OnApplicationBootstrap {
 
     const batchId = dto.batchId || `batch_${randomUUID().split('-')[0]}`;
 
-    // Check if batchId already exists
-    const existing = await this.batchRepository.findOne({ where: { batchId } });
+    // Check if this batchId already exists FOR THIS SESSION. Scoping by sessionId (matching how
+    // getBatchStatus/cancelBatch already query) makes (sessionId, batchId) the namespace: one session
+    // can't deny another a batchId, and the 400-vs-202 difference can't probe another session's ids.
+    const existing = await this.batchRepository.findOne({ where: { batchId, sessionId } });
     if (existing) {
       throw new BadRequestException(`Batch ID '${batchId}' already exists`);
     }
@@ -194,7 +196,16 @@ export class BulkMessageService implements OnApplicationBootstrap {
     if (!batch) return;
 
     this.processingBatches.set(batch.id, true);
+    // Always release the in-flight marker on every exit path (engine-not-found early return, a thrown
+    // save/send, or normal completion) — otherwise the map leaks an entry per such batch.
+    try {
+      await this.executeBatch(batch);
+    } finally {
+      this.processingBatches.delete(batch.id);
+    }
+  }
 
+  private async executeBatch(batch: MessageBatch): Promise<void> {
     // Update status to processing
     batch.status = BatchStatus.PROCESSING;
     batch.startedAt = new Date();
@@ -307,10 +318,29 @@ export class BulkMessageService implements OnApplicationBootstrap {
     }
     batch.completedAt = new Date();
     batch.results = results;
+    // The batch is terminal now (never resumed), so drop the base64 media payloads before persisting —
+    // otherwise the message_batches row retains multi-MB media forever. Intermediate (cadence) saves
+    // above keep the payload so a batch interrupted mid-run can still resume from currentIndex.
+    this.stripBatchMediaPayloads(batch.messages);
     await this.batchRepository.save(batch);
 
-    this.processingBatches.delete(batch.id);
     this.logger.log(`Batch ${batch.batchId} completed: ${batch.progress.sent} sent, ${batch.progress.failed} failed`);
+  }
+
+  /**
+   * Drop base64 payloads from a finished batch's stored message list. A completed/cancelled batch is
+   * terminal (never resumed), so the (often multi-MB) base64 in `message_batches.messages` is dead
+   * weight; the descriptive fields (mimetype/filename/caption/url) are kept.
+   */
+  private stripBatchMediaPayloads(messages: MessageBatch['messages']): void {
+    for (const m of messages) {
+      for (const key of ['image', 'video', 'audio', 'document']) {
+        const media = m.content[key] as { base64?: unknown } | undefined;
+        if (media && typeof media === 'object' && 'base64' in media) {
+          delete media.base64;
+        }
+      }
+    }
   }
 
   private applyVariables(content: BulkMessageContent, variables?: Record<string, string>): BulkMessageContent {
@@ -354,12 +384,14 @@ export class BulkMessageService implements OnApplicationBootstrap {
     result: MessageResult,
   ): Promise<void> {
     const media = content.image ?? content.video ?? content.audio ?? content.document;
+    // A bulk audio item flagged ptt is a voice note; store it in the 'voice' bucket like inbound PTT.
+    const persistType = type === 'audio' && content.audio?.ptt ? 'voice' : type;
     try {
       await this.messageService.saveOutgoingMessage(sessionId, {
         waMessageId: result.id,
         chatId,
         body: content.text ?? content.caption ?? '',
-        type,
+        type: persistType,
         timestamp: result.timestamp,
         status: MessageStatus.SENT,
         metadata: media
@@ -367,7 +399,7 @@ export class BulkMessageService implements OnApplicationBootstrap {
               media: {
                 mimetype: media.mimetype,
                 data: media.url ?? media.base64,
-                filename: content.document?.filename,
+                filename: media.filename,
               },
             }
           : undefined,
@@ -400,8 +432,9 @@ export class BulkMessageService implements OnApplicationBootstrap {
         });
       case 'audio':
         return engine.sendAudioMessage(chatId, {
-          mimetype: content.audio?.mimetype || 'audio/mpeg',
+          mimetype: content.audio?.mimetype || (content.audio?.ptt ? 'audio/ogg; codecs=opus' : 'audio/mpeg'),
           data: content.audio?.url || content.audio?.base64 || '',
+          ptt: content.audio?.ptt,
         });
       case 'document':
         return engine.sendDocumentMessage(chatId, {

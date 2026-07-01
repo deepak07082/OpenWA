@@ -127,6 +127,16 @@ describe('MessageService', () => {
       expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('628123456789@c.us', 'Hello');
     });
 
+    it('threads mentions through to the engine (#530)', async () => {
+      const input = { chatId: '120@g.us', text: 'hi @62811', mentions: ['62811@c.us'] };
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { sessionId: 'sess-1', input, type: 'text' },
+      });
+      await service.sendText('sess-1', input);
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('120@g.us', 'hi @62811', ['62811@c.us']);
+    });
+
     it('should save outgoing message as pending before sending, then update to sent', async () => {
       await service.sendText('sess-1', {
         chatId: '628123456789@c.us',
@@ -145,6 +155,20 @@ describe('MessageService', () => {
       );
       // save called twice: once for initial pending, once for status update to sent
       expect(repository.save).toHaveBeenCalledTimes(2);
+    });
+
+    it('returns success (not FAILED) when persisting the SENT state fails after a successful send', async () => {
+      // 1st save (PENDING) ok; 2nd save (SENT-state, after WhatsApp already accepted the message) throws.
+      (repository.save as jest.Mock)
+        .mockImplementationOnce((msg: unknown) => Promise.resolve(msg))
+        .mockRejectedValueOnce(new Error('transient db fault'));
+
+      const result = await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'Hello' });
+
+      // The send succeeded, so it is reported as success — not rethrown, not marked FAILED.
+      expect(result.messageId).toBe('wa-msg-1');
+      expect(result.timestamp).toBe(1706868000);
+      expect(hookManager.execute).not.toHaveBeenCalledWith('message:failed', expect.anything(), expect.anything());
     });
 
     it('executes the message:sending hook (message:sent now fires once from the engine message_create path)', async () => {
@@ -295,6 +319,20 @@ describe('MessageService', () => {
       );
     });
 
+    it('threads media mentions into the MediaInput (#530)', async () => {
+      await service.sendImage('sess-1', {
+        chatId: '120@g.us',
+        base64: 'AAAA',
+        mimetype: 'image/png',
+        caption: 'look @62811',
+        mentions: ['62811@c.us'],
+      });
+      expect(mockEngine.sendImageMessage).toHaveBeenCalledWith(
+        '120@g.us',
+        expect.objectContaining({ mentions: ['62811@c.us'] }),
+      );
+    });
+
     it('maps a blocked-media-URL SSRF error to HTTP 400', async () => {
       mockEngine.sendImageMessage.mockRejectedValueOnce(new SsrfBlockedError('Blocked internal address: 127.0.0.1'));
 
@@ -317,6 +355,29 @@ describe('MessageService', () => {
       } finally {
         delete process.env.MEDIA_DOWNLOAD_MAX_BYTES;
       }
+    });
+
+    it('strips the base64 payload from a FAILED media row but keeps mimetype/filename', async () => {
+      mockEngine.sendImageMessage.mockRejectedValueOnce(new Error('engine down'));
+
+      await expect(
+        service.sendImage('sess-1', {
+          chatId: '628123456789@c.us',
+          base64: 'QUJDREVGISBhIGJpZyBwYXlsb2Fk',
+          mimetype: 'image/png',
+          filename: 'pic.png',
+        }),
+      ).rejects.toThrow();
+
+      // The persisted FAILED row must not retain the (often multi-MB) base64 — it's never displayed
+      // or retried — but should keep the descriptive mimetype/filename.
+      const calls = (repository.save as jest.Mock).mock.calls as [Message][];
+      const saved = calls.at(-1)![0];
+      expect(saved.status).toBe(MessageStatus.FAILED);
+      const media = (saved.metadata as { media?: { data?: unknown; mimetype?: string; filename?: string } }).media;
+      expect(media?.data).toBeUndefined();
+      expect(media?.mimetype).toBe('image/png');
+      expect(media?.filename).toBe('pic.png');
     });
   });
 
@@ -469,6 +530,41 @@ describe('MessageService', () => {
         url: 'https://example.com/audio.ogg',
       });
       expect(mockEngine.sendAudioMessage).toHaveBeenCalled();
+    });
+
+    it('sends a voice note (ptt) and defaults the mimetype to ogg/opus when omitted', async () => {
+      await service.sendAudio('sess-1', {
+        chatId: 'test@c.us',
+        url: 'https://example.com/voice',
+        ptt: true,
+      });
+      expect(mockEngine.sendAudioMessage).toHaveBeenCalledWith(
+        'test@c.us',
+        expect.objectContaining({ ptt: true, mimetype: 'audio/ogg; codecs=opus' }),
+      );
+    });
+
+    it('respects a caller-supplied mimetype for a voice note', async () => {
+      await service.sendAudio('sess-1', {
+        chatId: 'test@c.us',
+        url: 'https://example.com/voice.ogg',
+        mimetype: 'audio/ogg',
+        ptt: true,
+      });
+      expect(mockEngine.sendAudioMessage).toHaveBeenCalledWith(
+        'test@c.us',
+        expect.objectContaining({ ptt: true, mimetype: 'audio/ogg' }),
+      );
+    });
+
+    it('persists a voice note as type "voice"', async () => {
+      await service.sendAudio('sess-1', { chatId: 'test@c.us', url: 'https://example.com/voice', ptt: true });
+      expect(repository.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'voice' }));
+    });
+
+    it('persists a plain audio send (no ptt) as type "audio"', async () => {
+      await service.sendAudio('sess-1', { chatId: 'test@c.us', url: 'https://example.com/audio.ogg' });
+      expect(repository.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'audio' }));
     });
   });
 
