@@ -197,7 +197,12 @@ export class StatsService {
       .addSelect('COUNT(*)', 'messageCount')
       .where('m.createdAt >= :since', { since })
       .groupBy('m.chatId')
-      .orderBy('messageCount', 'DESC')
+      // Alias must be quoted here: TypeORM emits the select alias as `AS "messageCount"`
+      // (quoted), but orderBy() passes its argument through unquoted, so on Postgres
+      // `ORDER BY messageCount` folds to lowercase `messagecount`, which doesn't match
+      // the quoted alias and 500s with "column messagecount does not exist". SQLite is
+      // case-insensitive here, so this only breaks on Postgres.
+      .orderBy('"messageCount"', 'DESC')
       .limit(10)
       .getRawMany<{ chatId: string; messageCount: string }>();
 
