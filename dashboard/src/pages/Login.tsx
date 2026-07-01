@@ -57,15 +57,15 @@ export function Login({ onLogin }: LoginProps) {
       <div className="login-card">
         <div className="login-logo">
           <img src="/openwa_logo.webp" alt="OpenWA" className="logo-icon" />
-          <span className="version-info">
+          {/* <span className="version-info">
             {t('login.version', {
               version: __APP_VERSION__,
               date: new Date(__BUILD_TIME__).toLocaleDateString(),
             })}
-          </span>
+          </span> */}
         </div>
 
-        <div className="login-language">
+        {/* <div className="login-language">
           <Languages size={18} />
           <select
             value={currentLang}
@@ -78,7 +78,7 @@ export function Login({ onLogin }: LoginProps) {
               </option>
             ))}
           </select>
-        </div>
+        </div> */}
 
         <form onSubmit={handleSubmit} className="login-form">
           <div className="input-group">
