@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, Languages } from 'lucide-react';
-import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
+// import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
 import { API_BASE_URL } from '../services/api';
 import './Login.css';
 
@@ -15,11 +15,11 @@ export function Login({ onLogin }: LoginProps) {
   const [showKey, setShowKey] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
-  const currentLang = resolveSupportedLanguage(i18n.resolvedLanguage || i18n.language);
+  // const currentLang = resolveSupportedLanguage(i18n.resolvedLanguage || i18n.language);
 
-  const changeLanguage = (language: SupportedLanguage) => {
-    void i18n.changeLanguage(language);
-  };
+  // const changeLanguage = (language: SupportedLanguage) => {
+  //   void i18n.changeLanguage(language);
+  // };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
