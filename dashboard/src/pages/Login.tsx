@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, Languages } from 'lucide-react';
-import { GithubIcon } from '../components/GithubIcon';
 import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
 import { API_BASE_URL } from '../services/api';
 import './Login.css';
@@ -109,31 +108,7 @@ export function Login({ onLogin }: LoginProps) {
             {isLoading ? t('login.connecting') : t('login.connect')}
           </button>
         </form>
-
-        <p className="login-help">
-          {t('login.help')}{' '}
-          <a
-            href="https://github.com/rmyndharis/OpenWA/blob/main/docs/01-project-overview.md"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            {t('login.viewDocs')}
-          </a>
-        </p>
       </div>
-
-      <footer className="login-footer">
-        <span>{t('login.footer')}</span>
-        <a
-          href="https://github.com/rmyndharis/OpenWA"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="github-link"
-          aria-label="GitHub"
-        >
-          <GithubIcon size={18} />
-        </a>
-      </footer>
     </div>
   );
 }
