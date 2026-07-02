@@ -65,13 +65,13 @@ export interface MessageStats {
   timeSeries: TimeSeriesPoint[];
   byType: Record<string, number>;
   bySession: Array<{ sessionId: string; name: string; sent: number; received: number }>;
-  topChats: Array<{ chatId: string; messageCount: number }>;
+  topChats: Array<{ chatId: string; chatName: string | null; messageCount: number }>;
 }
 
 export interface SessionStats {
   session: { id: string; name: string; status: string };
   messages: { sent: number; received: number; today: number; failed: number };
-  topChats: Array<{ chatId: string; count: number; lastActive: string }>;
+  topChats: Array<{ chatId: string; chatName: string | null; count: number; lastActive: string }>;
   hourlyActivity: Array<{ hour: number; sent: number; received: number }>;
 }
 
@@ -208,6 +208,7 @@ export class StatsService {
       .createQueryBuilder('m')
       .select('m.chatId', 'chatId')
       .addSelect('COUNT(*)', 'messageCount')
+      .addSelect('MAX(m.chatName)', 'chatName')
       .where('m.createdAt >= :since', { since })
       .groupBy('m.chatId')
       // Alias must be quoted here: TypeORM emits the select alias as `AS "messageCount"`
@@ -217,7 +218,7 @@ export class StatsService {
       // case-insensitive here, so this only breaks on Postgres.
       .orderBy('"messageCount"', 'DESC')
       .limit(10)
-      .getRawMany<{ chatId: string; messageCount: string }>();
+      .getRawMany<{ chatId: string; messageCount: string; chatName: string | null }>();
 
     return {
       timeSeries,
@@ -225,6 +226,7 @@ export class StatsService {
       bySession,
       topChats: topChats.map(c => ({
         chatId: c.chatId,
+        chatName: c.chatName ?? null,
         messageCount: parseInt(c.messageCount),
       })),
     };
@@ -268,11 +270,12 @@ export class StatsService {
       .select('m.chatId', 'chatId')
       .addSelect('COUNT(*)', 'count')
       .addSelect(maxCreatedAtSql(this.dataDbType), 'lastActive')
+      .addSelect('MAX(m.chatName)', 'chatName')
       .where('m.sessionId = :sessionId', { sessionId })
       .groupBy('m.chatId')
       .orderBy('count', 'DESC')
       .limit(10)
-      .getRawMany<{ chatId: string; count: string; lastActive: string }>();
+      .getRawMany<{ chatId: string; count: string; lastActive: string; chatName: string | null }>();
 
     // Hourly activity (last 24h)
     const hourlyActivity = await this.getHourlyActivity(sessionId);
@@ -282,6 +285,7 @@ export class StatsService {
       messages: { sent, received, today: todayCount, failed },
       topChats: topChats.map(c => ({
         chatId: c.chatId,
+        chatName: c.chatName ?? null,
         count: parseInt(c.count),
         lastActive: c.lastActive,
       })),

@@ -14,12 +14,14 @@ import {
   PluginMessagingCapability,
   PluginNetCapability,
   PluginConversationsCapability,
+  PluginHandoverCapability,
   PluginInstance,
   PluginStatus,
   PluginContext,
   IPlugin,
   PluginType,
   PluginLogger,
+  validateIngressManifest,
 } from './plugin.interfaces';
 import { isNetHostAllowed, performPluginFetch } from './plugin-net';
 import { PluginStorageService } from './plugin-storage.service';
@@ -29,6 +31,7 @@ import { WorkerThreadChannel } from './sandbox/worker-thread-channel';
 import { dispatchCapabilityVerb } from './sandbox/capability-router';
 import { PluginLogLevel } from './sandbox/protocol';
 import { buildConversationSendFacade } from './conversation-send-facade';
+import { shouldDispatchInbound } from './handover-gate';
 import { makeOnWebhookSubscribe } from './webhook-subscribe.util';
 import { INGRESS_DISPATCH_TIMEOUT_MS } from '../../modules/integration/integration.constants';
 import type { MessageService } from '../../modules/message/message.service';
@@ -201,6 +204,10 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     if (!manifest.id || !manifest.name || !manifest.version || !manifest.type || !manifest.main) {
       throw new Error(`Invalid manifest: missing required fields`);
     }
+    // Reject a malformed ingress declaration (SDK-major mismatch, missing webhook:ingress permission,
+    // duplicate/empty routes, non-positive toleranceSec) at load time instead of letting it silently
+    // load and become provisionable. No-op for plugins that declare no ingress.
+    validateIngressManifest(manifest);
 
     // Check if plugin already loaded
     if (this.plugins.has(manifest.id)) {
@@ -765,6 +772,30 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
           // Per-session activation gate: a session-scoped plugin only sees events for the sessions
           // it is activated for. Pass-through (don't dispatch into the worker) otherwise.
           if (!this.isHookActive(plugin, hookCtx.sessionId)) return { continue: true };
+          // Handover gate: once a human has taken over (or closed) a conversation, the bot stops
+          // seeing its inbound messages. Scoped to message:received only — every other hook event is
+          // unaffected. Best-effort + fail-open: a lookup failure (or an event/mapping shape the gate
+          // can't resolve) must never block a normal message from reaching the adapter.
+          if (event === 'message:received') {
+            try {
+              const chatId = (hookCtx.data as { chatId?: string } | undefined)?.chatId;
+              if (chatId && hookCtx.sessionId) {
+                const mapping = await this.getConversationMappingService().findForChat(
+                  hookCtx.sessionId,
+                  chatId,
+                  pluginId,
+                );
+                if (!shouldDispatchInbound(mapping)) return { continue: true };
+              }
+            } catch (error) {
+              this.logger.debug(`Handover gate lookup failed for plugin ${pluginId}; dispatching normally`, {
+                pluginId,
+                event,
+                error: error instanceof Error ? error.message : String(error),
+                action: 'handover_gate_fail_open',
+              });
+            }
+          }
           return liveHost
             .dispatchHook({
               event,
@@ -947,11 +978,36 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
         },
         // Re-establish the in-flight hook context around the downstream send so an adapter that calls
         // conversation.send from within its own ingress handling can't echo-loop back into itself via
-        // its own outbound message:sending hook (mirrors the sandboxed worker-cap wrap below).
-        runGuarded: (events, run) => this.hookManager.runInFlight(events as HookEvent[], run),
+        // its own outbound message:sending hook. Gate on an ALREADY-in-flight event (mirrors the
+        // worker-cap wrap's `inFlight.length > 0` check): a plain top-level send must NOT suppress
+        // message:sending for unrelated observers (audit/moderation) — only genuine re-entrancy does.
+        runGuarded: (events, run) =>
+          (events as HookEvent[]).some(e => this.hookManager.isInFlight(e))
+            ? this.hookManager.runInFlight(events as HookEvent[], run)
+            : run(),
         sendText: (sessionId, opts) => this.getMessageService().sendText(sessionId, opts),
         reply: (sessionId, opts) => this.getMessageService().reply(sessionId, opts),
       } satisfies Parameters<typeof buildConversationSendFacade>[0]) satisfies PluginConversationsCapability,
+      handover: {
+        set: async (key, state) => {
+          // Same gate as conversation.send: flipping handover is part of owning the conversation, so
+          // it reuses CONVERSATION_SEND rather than adding a new permission.
+          this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);
+          this.assertSessionAllowed(plugin.manifest, key.sessionId);
+          const mapping = await this.getConversationMappingService().get({
+            sessionId: key.sessionId,
+            chatId: key.chatId,
+            pluginId: plugin.manifest.id,
+            instanceId: key.instanceId,
+          });
+          if (!mapping) {
+            throw new PluginCapabilityError(
+              `Plugin ${plugin.manifest.id}: no conversation mapping for session ${key.sessionId} / chat ${key.chatId} / instance ${key.instanceId}`,
+            );
+          }
+          await this.getConversationMappingService().setHandover(mapping.id, state);
+        },
+      } satisfies PluginHandoverCapability,
     };
   }
 
