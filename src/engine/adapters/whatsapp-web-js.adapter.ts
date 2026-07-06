@@ -15,6 +15,7 @@ import {
   GroupInfo,
   GroupParticipant,
   LocationInput,
+  PollInput,
   ContactCard,
   MessageReaction,
   Label,
@@ -34,12 +35,14 @@ import {
   ReactionEvent,
 } from '../interfaces/whatsapp-engine.interface';
 import { resolveWebVersionPin } from '../wa-web-version';
-import { isChannelJid } from '../identity/wa-id';
+import { isChannelJid, userPart } from '../identity/wa-id';
+import { LidMappingStore } from '../identity/lid-mapping-store.service';
 import { ChatLabelsUnsupportedError } from '../../common/errors/chat-labels-unsupported.error';
 import { createLogger } from '../../common/services/logger.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
+import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import {
   GroupChat,
@@ -100,6 +103,36 @@ export function isSupportedProxyUrl(url: string): boolean {
   }
 }
 
+export interface ProxyLaunchConfig {
+  /** Credential-less `--proxy-server` value — Chromium ignores credentials embedded in this flag. */
+  serverArg: string;
+  /** Username/password for whatsapp-web.js's `proxyAuthentication` (→ `page.authenticate`, HTTP/HTTPS only). */
+  proxyAuthentication?: { username: string; password: string };
+  /** The URL carries credentials for a SOCKS proxy, which Chromium cannot authenticate at all. */
+  socksAuthUnsupported: boolean;
+}
+
+/**
+ * Split a proxy URL into a credential-less `--proxy-server` value plus, for an HTTP/HTTPS proxy, the
+ * username/password to hand to whatsapp-web.js's `proxyAuthentication` (which calls `page.authenticate`
+ * — the only way Chromium authenticates a proxy). Credentials embedded in `--proxy-server` are ignored
+ * by Chromium, and SOCKS proxies cannot be authenticated at all, so SOCKS credentials are surfaced via
+ * `socksAuthUnsupported` for the caller to warn about instead of failing with an opaque nav timeout (#628).
+ * Call only with a URL that already passed {@link isSupportedProxyUrl}.
+ */
+export function buildProxyLaunchConfig(url: string): ProxyLaunchConfig {
+  const parsed = new URL(url);
+  const serverArg = `${parsed.protocol}//${parsed.host}`;
+  const username = decodeURIComponent(parsed.username);
+  const password = decodeURIComponent(parsed.password);
+  const hasCredentials = username !== '' || password !== '';
+  const isSocks = parsed.protocol === 'socks4:' || parsed.protocol === 'socks5:';
+  if (hasCredentials && !isSocks) {
+    return { serverArg, proxyAuthentication: { username, password }, socksAuthUnsupported: false };
+  }
+  return { serverArg, socksAuthUnsupported: hasCredentials && isSocks };
+}
+
 /**
  * Whether a MediaInput's string `data` is an http(s) URL (to be fetched through the SSRF-guarded
  * loadRemoteMedia) rather than base64. Case-insensitive, matching the Baileys adapter — a mixed-case
@@ -139,6 +172,9 @@ export interface WhatsAppWebJsConfig {
     url: string;
     type: 'http' | 'https' | 'socks4' | 'socks5';
   };
+  // Shared lid<->phone table. Threaded in so the wwjs engine can persist the `phone -> lid` pairs it
+  // learns while resolving sends, letting the message read-path bridge `@c.us`/`@lid` rows (#583 R3).
+  lidMappingStore?: LidMappingStore;
 }
 
 const READY_RECONCILE_INTERVAL_MS = 2000;
@@ -184,6 +220,15 @@ export function extractLinkedParentJID(groupMetadata?: GroupMetadataRaw): string
   }
 
   return candidate._serialized ?? null;
+}
+
+/**
+ * True when a send error is whatsapp-web.js's "recipient needs a LID we don't have" failure, raised
+ * when sending to a `@c.us` for a contact WhatsApp has migrated to `@lid`.
+ * ponytail: matched on the wwjs error text — there is no structured code; revisit if wwjs changes it.
+ */
+export function isNoLidForUserError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes('No LID for user');
 }
 
 export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
@@ -308,12 +353,21 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
       // Add proxy configuration if provided — but only when the URL parses to a supported scheme, so
       // a malformed/stored proxy value can't break the Chromium launch or smuggle a non-proxy scheme.
+      let proxyAuthentication: { username: string; password: string } | undefined;
       if (this.config.proxy) {
         if (isSupportedProxyUrl(this.config.proxy.url)) {
-          puppeteerArgs.push(`--proxy-server=${this.config.proxy.url}`);
-          this.logger.log(
-            `Using proxy: ${this.config.proxy.type}://${this.config.proxy.url.replace(/:[^:@]*@/, ':***@')}`,
-          );
+          // Chromium ignores credentials in --proxy-server; pass a credential-less server and hand the
+          // username/password to wwjs's proxyAuthentication (page.authenticate) for HTTP/HTTPS proxies (#628).
+          const proxyLaunch = buildProxyLaunchConfig(this.config.proxy.url);
+          puppeteerArgs.push(`--proxy-server=${proxyLaunch.serverArg}`);
+          proxyAuthentication = proxyLaunch.proxyAuthentication;
+          if (proxyLaunch.socksAuthUnsupported) {
+            this.logger.warn(
+              `Proxy for session ${this.config.sessionId} has credentials on a SOCKS proxy, but Chromium ` +
+                `cannot authenticate SOCKS proxies. Use an IP-authorized proxy or an HTTP/HTTPS proxy instead.`,
+            );
+          }
+          this.logger.log(`Using proxy: ${proxyLaunch.serverArg}`);
         } else {
           this.logger.warn(`Ignoring invalid proxy URL for session ${this.config.sessionId}`);
         }
@@ -346,6 +400,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           ...(this.config.puppeteer?.executablePath ? { executablePath: this.config.puppeteer.executablePath } : {}),
         },
         ...(authTimeoutMs !== undefined ? { authTimeoutMs } : {}),
+        ...(proxyAuthentication ? { proxyAuthentication } : {}),
         ...(versionPin ?? {}),
       });
 
@@ -822,13 +877,84 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.pushName;
   }
 
+  // Cache of resolved individual recipients: `<phone>@c.us` -> the id `sendMessage` accepts (a
+  // `<lid>@lid` for a migrated contact, or the confirmed `@c.us` for a non-migrated one). `getNumberId`
+  // is a rate-limited WhatsApp Web existence probe that also throws intermittently, so caching every
+  // confirmed resolution keeps ordinary sends from re-probing on each message (#580). A `@lid` is
+  // stable; a stale entry (a contact that migrates mid-session) self-heals via the retry in
+  // `sendResolved`.
+  // ponytail: unbounded Map, bounded in practice by distinct recipients per session; add an LRU only
+  // if a session ever addresses a truly unbounded set of fresh numbers.
+  private readonly resolvedSendIds = new Map<string, string>();
+
+  /**
+   * Resolve an individual (`@c.us`) recipient to the id whatsapp-web.js will accept. WhatsApp has
+   * migrated some contacts to privacy-id addressing, for which `sendMessage` throws `No LID for user`
+   * on the phone WID but accepts the `@lid` that `getNumberId` returns (#573). Any server-confirmed
+   * resolution (a distinct `@lid` OR a confirmed non-migrated `@c.us`) is cached, since it is stable
+   * and re-probing costs a rate-limited round-trip (#580); a `null`/thrown lookup is NOT cached so an
+   * unregistered or transiently-flaky contact keeps being retried. Groups/channels and already-`@lid`
+   * targets are returned unchanged, and any resolution failure falls back to the original id so a send
+   * is never blocked on it.
+   */
+  private async resolveSendId(chatId: string): Promise<string> {
+    if (!chatId.endsWith('@c.us')) {
+      return chatId;
+    }
+    const cached = this.resolvedSendIds.get(chatId);
+    if (cached) {
+      return cached;
+    }
+    try {
+      const wid = await this.getNumberId(chatId);
+      if (wid) {
+        this.resolvedSendIds.set(chatId, wid);
+        if (wid.endsWith('@lid')) {
+          // Persist the learned phone -> lid so the message read-path (resolveJidCandidates) can
+          // bridge this contact's `@c.us` and `@lid` rows on a pure whatsapp-web.js deployment
+          // (#583 R3). Fire-and-forget: resolution (and the send) must never block/fail on the write.
+          void this.config.lidMappingStore
+            ?.remember(userPart(wid), userPart(chatId), this.config.sessionId)
+            ?.catch(() => {});
+        }
+        return wid;
+      }
+      return chatId;
+    } catch {
+      return chatId;
+    }
+  }
+
+  /**
+   * Resolve `chatId` and run `send` against the resolved id. If the send fails with `No LID for user`
+   * — the signature of a contact whose cached/resolved id is stale (typically a `@c.us` for a contact
+   * that has since migrated to `@lid`) — drop the mapping, re-resolve once, and retry only if the
+   * fresh id differs, so a genuinely unreachable recipient surfaces its error instead of looping.
+   */
+  private async sendResolved<T>(chatId: string, send: (to: string) => Promise<T>): Promise<T> {
+    const to = await this.resolveSendId(chatId);
+    try {
+      return await send(to);
+    } catch (err) {
+      if (!chatId.endsWith('@c.us') || !isNoLidForUserError(err)) {
+        throw err;
+      }
+      this.resolvedSendIds.delete(chatId);
+      const fresh = await this.resolveSendId(chatId);
+      if (fresh === to) {
+        throw err;
+      }
+      return send(fresh);
+    }
+  }
+
   async sendTextMessage(chatId: string, text: string, mentions?: string[]): Promise<MessageResult> {
     this.ensureReady();
     // wwebjs accepts neutral `<phone>@c.us` WIDs directly as mentionedJidList, so no de-normalization
     // is needed. Omit the options object entirely when none are given to keep today's send behavior.
-    const msg = mentions?.length
-      ? await this.client!.sendMessage(chatId, text, { mentions })
-      : await this.client!.sendMessage(chatId, text);
+    const msg = await this.sendResolved(chatId, to =>
+      mentions?.length ? this.client!.sendMessage(to, text, { mentions }) : this.client!.sendMessage(to, text),
+    );
     return {
       id: msg.id._serialized,
       timestamp: msg.timestamp,
@@ -873,12 +999,15 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
     }
 
-    const msg = await this.client!.sendMessage(chatId, messageMedia, {
-      caption: media.caption,
-      ...(media.mentions?.length ? { mentions: media.mentions } : {}),
-      // sendAudioAsVoice only for audio; {...undefined} contributes no keys.
-      ...extraOptions,
-    });
+    // Build the media once (a remote URL is fetched here); sendResolved may retry the send itself.
+    const msg = await this.sendResolved(chatId, to =>
+      this.client!.sendMessage(to, messageMedia, {
+        caption: media.caption,
+        ...(media.mentions?.length ? { mentions: media.mentions } : {}),
+        // sendAudioAsVoice only for audio; {...undefined} contributes no keys.
+        ...extraOptions,
+      }),
+    );
 
     return {
       id: msg.id._serialized,
@@ -983,7 +1112,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       name: location.description || '',
       address: location.address || '',
     });
-    const msg = await this.client!.sendMessage(chatId, loc);
+    const msg = await this.sendResolved(chatId, to => this.client!.sendMessage(to, loc));
     return {
       id: msg.id._serialized,
       timestamp: msg.timestamp,
@@ -996,9 +1125,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // can't inject extra vCard fields — the previous inline build interpolated raw values.
     const vcard = buildVCard(contact);
 
-    const msg = await this.client!.sendMessage(chatId, vcard, {
-      parseVCards: true,
-    });
+    const msg = await this.sendResolved(chatId, to =>
+      this.client!.sendMessage(to, vcard, {
+        parseVCards: true,
+      }),
+    );
     return {
       id: msg.id._serialized,
       timestamp: msg.timestamp,
@@ -1019,9 +1150,33 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
     }
 
-    const msg = await this.client!.sendMessage(chatId, messageMedia, {
-      sendMediaAsSticker: true,
-    });
+    const msg = await this.sendResolved(chatId, to =>
+      this.client!.sendMessage(to, messageMedia, {
+        sendMediaAsSticker: true,
+      }),
+    );
+    return {
+      id: msg.id._serialized,
+      timestamp: msg.timestamp,
+    };
+  }
+
+  async sendPollMessage(chatId: string, poll: PollInput): Promise<MessageResult> {
+    this.ensureReady();
+    // Import Poll dynamically like Location; the .default fallback covers builds where the
+    // classes land on module.default (a plain `module.Poll` would be undefined there and
+    // `new Poll` fails with "not a constructor").
+    const module = await import('whatsapp-web.js');
+    const Poll = module.Poll || module.default?.Poll;
+
+    // wwebjs's typings mark `messageSecret` as required, but at runtime it is optional (it is
+    // only used as a custom poll id), so cast to the constructor's options type to pass just
+    // allowMultipleAnswers.
+    type PollSendOptions = ConstructorParameters<typeof Poll>[2];
+    const pollOptions = { allowMultipleAnswers: poll.allowMultipleAnswers === true } as PollSendOptions;
+    const msg = await this.sendResolved(chatId, to =>
+      this.client!.sendMessage(to, new Poll(poll.name, poll.options, pollOptions)),
+    );
     return {
       id: msg.id._serialized,
       timestamp: msg.timestamp,
@@ -1039,7 +1194,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       throw new MessageNotFoundError(quotedMsgId);
     }
 
-    const msg = await quotedMsg.reply(text);
+    // Reply's send leg hits the same `No LID for user` path as a normal send for a migrated contact,
+    // so route it through sendResolved (resolve @c.us->@lid, cache, self-heal). reply(content, chatId)
+    // accepts an explicit target (#583 R1).
+    const msg = await this.sendResolved(chatId, to => quotedMsg.reply(text, to));
     return {
       id: msg.id._serialized,
       timestamp: msg.timestamp,
@@ -1056,7 +1214,14 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       throw new MessageNotFoundError(messageId);
     }
 
-    await msgToForward.forward(toChatId);
+    // The forward's send leg fails with `No LID for user` for a LID-migrated destination, so resolve
+    // it (and self-heal a stale mapping) via sendResolved. Capture the id actually sent to so the
+    // id-recovery below reads back from the SAME (resolved) chat, not the raw @c.us (#583 R1).
+    let resolvedTo = toChatId;
+    await this.sendResolved(toChatId, to => {
+      resolvedTo = to;
+      return msgToForward.forward(to);
+    });
 
     // whatsapp-web.js's forward() returns void, so BEST-EFFORT recover the REAL id of the sent copy by
     // reading it back from the destination chat (the most recent outgoing message). The delivery-ack
@@ -1067,7 +1232,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // which could cross-drive another row's delivery status. Concurrent forwards to the same chat may
     // mis-identify the copy — acceptable for delivery-status accuracy.
     try {
-      const destChat = await this.client!.getChatById(toChatId);
+      const destChat = await this.client!.getChatById(resolvedTo);
       const sentByMe = (await destChat?.fetchMessages({ limit: 5, fromMe: true })) ?? [];
       let sent: (typeof sentByMe)[number] | undefined;
       for (const m of sentByMe) {
@@ -1203,6 +1368,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   // Reactions (Phase 3)
   async reactToMessage(chatId: string, messageId: string, emoji: string): Promise<void> {
     this.ensureReady();
+    // NOTE: do NOT resolve chatId to @lid here — whatsapp-web.js reacts using the found message's own
+    // id, not this chatId, so LID-resolving the lookup gives no send benefit and would miss a message
+    // stored under the pre-migration @c.us chat (#583 R1 review).
     const chat = await this.client!.getChatById(chatId);
     const messages = await chat.fetchMessages({ limit: 100 });
     const message = messages.find(m => m.id._serialized === messageId);
@@ -1355,23 +1523,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async getChannelById(channelId: string): Promise<Channel | null> {
     this.ensureReady();
-    try {
-      const ch = await (this.client as unknown as BusinessClient).getChannelById(channelId);
-      if (!ch) {
-        return null;
-      }
-      return {
-        id: String(typeof ch.id === 'object' ? ch.id._serialized : ch.id),
-        name: String(ch.name || ''),
-        description: ch.description ? String(ch.description) : undefined,
-        inviteCode: ch.inviteCode ? String(ch.inviteCode) : undefined,
-        subscriberCount: ch.subscriberCount ? Number(ch.subscriberCount) : undefined,
-        verified: ch.verified ? Boolean(ch.verified) : undefined,
-      };
-    } catch (error) {
-      this.logger.warn(`Failed to get channel: ${channelId}`, String(error));
-      return null;
-    }
+    // wwebjs 1.34.x exposes no client.getChannelById; resolve from the subscribed-channel list (#625).
+    const channels = await this.getSubscribedChannels();
+    return channels.find(c => c.id === channelId) ?? null;
   }
 
   async subscribeToChannel(inviteCode: string): Promise<Channel> {
@@ -1393,26 +1547,24 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async getChannelMessages(channelId: string, limit: number = 50): Promise<ChannelMessage[]> {
     this.ensureReady();
-    try {
-      const ch = await (this.client as unknown as BusinessClient).getChannelById(channelId);
-      if (!ch) {
-        throw new Error(`Channel ${channelId} not found`);
-      }
-      const messages = await ch.fetchMessages({ limit });
-      if (!messages) {
-        return [];
-      }
-      return messages.map(msg => ({
-        id: String(typeof msg.id === 'object' ? msg.id._serialized : msg.id),
-        body: String(msg.body || ''),
-        timestamp: Number(msg.timestamp),
-        hasMedia: Boolean(msg.hasMedia),
-        mediaUrl: msg.mediaUrl ? String(msg.mediaUrl) : undefined,
-      }));
-    } catch (error) {
-      this.logger.error(`Failed to get channel messages: ${String(error)}`);
-      return [];
+    // wwebjs 1.34.x has no client.getChannelById (calling it threw and the error was swallowed into an
+    // empty list, #625). The subscribed Channel instances returned by getChannels() carry fetchMessages(),
+    // so resolve the channel from that list and read its messages. A missing channel surfaces as a
+    // ChannelNotFoundError (→ 404, like getChannelById) so callers can tell "no messages" apart from
+    // "wrong/unsubscribed channel" instead of getting a silent [].
+    const channels = await (this.client as unknown as BusinessClient).getChannels();
+    const channel = channels?.find(c => (typeof c.id === 'object' ? c.id._serialized : c.id) === channelId);
+    if (!channel) {
+      throw new ChannelNotFoundError(channelId);
     }
+    const messages = await channel.fetchMessages({ limit });
+    return (messages ?? []).map(msg => ({
+      id: String(typeof msg.id === 'object' ? msg.id._serialized : msg.id),
+      body: String(msg.body || ''),
+      timestamp: Number(msg.timestamp),
+      hasMedia: Boolean(msg.hasMedia),
+      mediaUrl: msg.mediaUrl ? String(msg.mediaUrl) : undefined,
+    }));
   }
 
   // ========== Gap Quick Wins Implementation ==========
@@ -1434,6 +1586,25 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       out.isStatusBroadcast = chatId === 'status@broadcast';
       const call = extractWwebjsCall(msg);
       if (call) out.call = call;
+      // Mirror the live handler's location + quoted-message enrichment so history renders identically —
+      // buildIncomingMessageBase sets type='location' but no coordinates, and never resolves quotes.
+      if (msg.type === MessageTypes.LOCATION && msg.location) {
+        out.location = {
+          latitude: Number(msg.location.latitude),
+          longitude: Number(msg.location.longitude),
+          description: msg.location.description || undefined,
+          address: msg.location.address || undefined,
+          url: msg.location.url || undefined,
+        };
+      }
+      if (msg.hasQuotedMsg) {
+        try {
+          const quoted = await msg.getQuotedMessage();
+          out.quotedMessage = { id: quoted.id._serialized, body: quoted.body };
+        } catch (error) {
+          this.logger.warn(`Failed to resolve quoted message for ${msg.id._serialized}: ${String(error)}`);
+        }
+      }
       if (includeMedia && msg.hasMedia) {
         try {
           // Same pre-gate + limiter as live media: a large historical blob shouldn't bloat the response/heap.
@@ -1451,6 +1622,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   // Delete Message
   async deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<void> {
     this.ensureReady();
+    // NOTE: do NOT resolve chatId to @lid here — delete operates on the found message's own key, not
+    // this chatId, so LID-resolving the lookup gives no benefit and would miss a message stored under
+    // the pre-migration @c.us chat (#583 R1 review).
     const chat = await this.client!.getChatById(chatId);
     const messages = await chat.fetchMessages({ limit: 100 });
     const message = messages.find(m => m.id._serialized === messageId || m.id.id === messageId);
@@ -1677,7 +1851,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       return;
     }
     try {
-      const chat = await this.client!.getChatById(chatId);
+      const to = await this.resolveSendId(chatId);
+      const chat = await this.client!.getChatById(to);
       if (state === 'typing') {
         await chat.sendStateTyping();
       } else if (state === 'recording') {
@@ -1686,8 +1861,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         await chat.clearState();
       }
     } catch (error) {
-      // Presence is best-effort — a failure here must never break the surrounding send.
-      this.logger.error(`Error setting chat state '${state}' for ${chatId}`, String(error));
+      // Presence is best-effort and already swallowed here — it never breaks the surrounding send —
+      // so log at WARN, not ERROR: a migrated contact routinely yields `No LID for user` on the
+      // presence path and an ERROR line reads as a fault when nothing actually failed (#582).
+      this.logger.warn(`Could not set chat state '${state}' for ${chatId} (best-effort)`, String(error));
     }
   }
 

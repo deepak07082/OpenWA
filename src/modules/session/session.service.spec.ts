@@ -8,6 +8,7 @@ import { Session, SessionStatus } from './entities/session.entity';
 import { Message, MessageStatus } from '../message/entities/message.entity';
 import { MessageBatch } from '../message/entities/message-batch.entity';
 import { EngineFactory } from '../../engine/engine.factory';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
@@ -42,6 +43,7 @@ describe('SessionService', () => {
   let webhookService: jest.Mocked<Partial<WebhookService>>;
   let hookManager: jest.Mocked<Partial<HookManager>>;
   let configService: jest.Mocked<Partial<ConfigService>>;
+  let lidMappingStore: jest.Mocked<Partial<LidMappingStoreService>>;
   let mockEngine: Record<string, jest.Mock>;
 
   beforeEach(async () => {
@@ -78,6 +80,7 @@ describe('SessionService', () => {
     mockEngine = {
       initialize: jest.fn().mockResolvedValue(undefined),
       destroy: jest.fn().mockResolvedValue(undefined),
+      forceDestroy: jest.fn().mockResolvedValue(undefined),
       disconnect: jest.fn().mockResolvedValue(undefined),
       getQRCode: jest.fn().mockReturnValue(null),
       getGroups: jest.fn().mockResolvedValue([]),
@@ -117,6 +120,12 @@ describe('SessionService', () => {
       get: jest.fn().mockImplementation(<T>(_key: string, def?: T): T => def as T),
     };
 
+    lidMappingStore = {
+      remember: jest.fn().mockResolvedValue(undefined),
+      getCached: jest.fn().mockReturnValue(undefined),
+      lidsForPhone: jest.fn().mockReturnValue([]),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SessionService,
@@ -137,6 +146,7 @@ describe('SessionService', () => {
         { provide: WebhookService, useValue: webhookService },
         { provide: HookManager, useValue: hookManager },
         { provide: ConfigService, useValue: configService },
+        { provide: LidMappingStoreService, useValue: lidMappingStore },
       ],
     }).compile();
 
@@ -258,6 +268,15 @@ describe('SessionService', () => {
 
       await expect(service.create({ name: 'test-session' })).rejects.toThrow(ConflictException);
     });
+
+    it('maps a name UNIQUE-violation on insert to 409 when two concurrent creates race past the pre-check', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(null); // pre-check passes (TOCTOU window)
+      (repository.create as jest.Mock).mockReturnValue(createMockSession());
+      const uniqueErr = Object.assign(new Error('duplicate key value'), { driverError: { code: '23505' } });
+      (dataSource.transaction as jest.Mock).mockRejectedValueOnce(uniqueErr);
+
+      await expect(service.create({ name: 'test-session' })).rejects.toThrow(ConflictException);
+    });
   });
 
   // ── findAll / findOne / findByName ────────────────────────────────
@@ -345,6 +364,24 @@ describe('SessionService', () => {
       expect(rejected[0].reason).toBeInstanceOf(BadRequestException);
       // The decisive assertion: exactly ONE engine was ever created — no orphaned second engine.
       expect(engineFactory.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('evicts and tears down the engine when engine.initialize() fails (no orphan wedging the session)', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (engineFactory.create as jest.Mock).mockClear().mockReturnValue(mockEngine);
+      mockEngine.initialize.mockRejectedValueOnce(new Error('chromium launch failed'));
+
+      await expect(service.start('sess-uuid-1')).rejects.toThrow('chromium launch failed');
+
+      const engines = (service as unknown as { engines: Map<string, unknown> }).engines;
+      expect(engines.has('sess-uuid-1')).toBe(false); // not left orphaned → session can be started again
+      // forceDestroy(), not destroy(): initialize() failing usually means the browser/CDP
+      // connection is already broken, so only a direct SIGKILL (forceDestroy) reliably reaps the
+      // OS-level Chromium process — a graceful destroy() has nothing live to talk to and can only
+      // time out, leaving the process orphaned (the actual bug this test now guards against).
+      expect(mockEngine.forceDestroy).toHaveBeenCalled();
+      expect(mockEngine.destroy).not.toHaveBeenCalled();
     });
 
     it('allows a fresh start after the previous one completed (reservation is cleared)', async () => {
@@ -1292,6 +1329,9 @@ describe('SessionService', () => {
         expect(received).toHaveLength(1);
         expect((received[0][2] as IncomingMessage).senderPhone).toBe('628111222333');
         expect(mockEngine.resolveContactPhone).toHaveBeenCalledWith('111@lid');
+        // #583 R3 Phase 2: the resolved inbound @lid -> phone is persisted so the read-path can bridge
+        // this contact's @lid and @c.us rows even if the operator never sent to them.
+        expect(lidMappingStore.remember).toHaveBeenCalledWith('111', '628111222333', expect.any(String));
       } finally {
         delete process.env.RESOLVE_LID_TO_PHONE;
       }

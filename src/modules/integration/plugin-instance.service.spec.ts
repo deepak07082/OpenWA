@@ -2,6 +2,7 @@ import { DataSource } from 'typeorm';
 import { PluginInstance } from './entities/plugin-instance.entity';
 import { PluginInstanceService, InstanceExistsError } from './plugin-instance.service';
 import { AddIntegrationFabric1781900000000 } from '../../database/migrations/1781900000000-AddIntegrationFabric';
+import type { PluginConfigSchema } from '../../core/plugins/plugin.interfaces';
 
 describe('PluginInstanceService', () => {
   let ds: DataSource;
@@ -29,10 +30,80 @@ describe('PluginInstanceService', () => {
     expect(service.maskedView(inst).secret).toBe('***');
   });
 
+  it('masks secret:true config fields (apiToken) on masked reads', () => {
+    const schema = {
+      type: 'object',
+      properties: { apiToken: { type: 'string', secret: true }, accountId: { type: 'number' } },
+    } as PluginConfigSchema;
+    const inst = {
+      id: 'p:i',
+      secret: 'x',
+      config: { apiToken: 'live-token', accountId: 3 },
+    } as unknown as PluginInstance;
+    const masked = service.maskedView(inst, schema);
+    const config = masked.config as Record<string, unknown>;
+    expect(masked.secret).toBe('***');
+    expect(config.apiToken).toBe('***');
+    expect(config.accountId).toBe(3);
+  });
+
+  it('masks the ENTIRE config when the schema is unavailable, e.g. the plugin is unloaded (fail-closed)', () => {
+    const inst = {
+      id: 'p:i',
+      secret: 'x',
+      config: { apiToken: 'live-token', accountId: 3 },
+    } as unknown as PluginInstance;
+    const config = service.maskedView(inst, undefined).config as Record<string, unknown>;
+    expect(config.apiToken).toBe('***');
+    expect(config.accountId).toBe('***');
+  });
+
   it('resolves an existing instance and returns null for an unknown one', async () => {
     await service.mint('chatwoot', 'acct1', {});
     expect((await service.resolve('chatwoot', 'acct1'))?.id).toBe('chatwoot:acct1');
     expect(await service.resolve('chatwoot', 'nope')).toBeNull();
+  });
+
+  it('accepts a valid operator secret, rejects short/empty, else auto-generates', async () => {
+    const ok = await service.create('chatwoot-adapter', 'a1', { secret: 'cw-secret-16chars!' });
+    expect(ok.secret).toBe('cw-secret-16chars!');
+    await expect(service.create('chatwoot-adapter', 'a2', { secret: '   ' })).rejects.toThrow(/secret/i);
+    await expect(service.create('chatwoot-adapter', 'a3', { secret: 'short' })).rejects.toThrow(/16/);
+    const gen = await service.create('chatwoot-adapter', 'a4', {});
+    expect(gen.secret).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('masks a NESTED secret:true config field on masked reads (recursive redaction)', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        provider: {
+          type: 'object',
+          properties: { apiToken: { type: 'string', secret: true }, region: { type: 'string' } },
+        },
+      },
+    } as PluginConfigSchema;
+    const inst = {
+      id: 'p:i',
+      secret: 'x',
+      config: { provider: { apiToken: 'live-token', region: 'us' } },
+    } as unknown as PluginInstance;
+    const config = service.maskedView(inst, schema).config as { provider: Record<string, unknown> };
+    expect(config.provider.apiToken).toBe('***');
+    expect(config.provider.region).toBe('us');
+  });
+
+  it('update restores a masked (sentinel) secret to the stored value instead of persisting "***"', async () => {
+    const schema = {
+      type: 'object',
+      properties: { apiToken: { type: 'string', secret: true }, accountId: { type: 'number' } },
+    } as PluginConfigSchema;
+    await service.create('chatwoot', 'acct1', { config: { apiToken: 'real-token', accountId: 1 } });
+
+    // Dashboard round-trips the masked config back with an edited non-secret field.
+    const updated = await service.update('chatwoot', 'acct1', { config: { apiToken: '***', accountId: 2 } }, schema);
+
+    expect(updated?.config).toEqual({ apiToken: 'real-token', accountId: 2 });
   });
 });
 

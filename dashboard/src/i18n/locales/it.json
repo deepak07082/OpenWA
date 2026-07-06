@@ -119,6 +119,7 @@
     "placeholderDesc": "Seleziona una chat attiva dalla barra laterale a sinistra per iniziare a leggere e inviare messaggi WhatsApp.",
     "deleteConfirm": "Eliminare questo messaggio per tutti?",
     "messageDeleted": "🚫 Questo messaggio è stato eliminato",
+    "messageMasked": "🔒 Nascosto da WhatsApp sui dispositivi collegati — controlla sul telefono principale",
     "errors": {
       "loadSessions": "Impossibile caricare le sessioni",
       "loadChats": "Impossibile caricare le chat",
@@ -145,7 +146,7 @@
     "connectionError": "Impossibile connettersi al server. Riprova.",
     "help": "Serve aiuto?",
     "viewDocs": "Visualizza la documentazione",
-    "footer": "Fatto con ❤️ da Yudhi Armyndharis e dalla Community di OpenWA",
+    "footer": "Fatto con il ❤️ da Yudhi Armyndharis e dalla Community di OpenWA",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {

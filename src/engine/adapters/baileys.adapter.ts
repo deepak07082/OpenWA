@@ -25,6 +25,7 @@ import {
   MessageReaction,
   MessageResult,
   PaginatedProducts,
+  PollInput,
   Product,
   ProductQueryOptions,
   ReactionEvent,
@@ -265,7 +266,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
       const h = history as unknown as { lidPnMappings?: { lid: string; pn: string }[]; syncType?: unknown };
       const lidPnMappings = h.lidPnMappings;
       this.sessionStore.addLidMappings(lidPnMappings ?? []);
-      this.captureHistoryMessages(history.messages ?? []);
+      void this.captureHistoryMessages(history.messages ?? []);
       this.logger.debug('History sync received', {
         action: 'baileys_history_set',
         sessionId: this.config.sessionId,
@@ -506,7 +507,14 @@ export class BaileysAdapter implements IWhatsAppEngine {
   async sendChatState(chatId: string, state: ChatState): Promise<void> {
     this.ensureReady();
     const presence = state === 'typing' ? 'composing' : state === 'recording' ? 'recording' : 'paused';
-    await this.sock!.sendPresenceUpdate(presence, chatId);
+    try {
+      await this.sock!.sendPresenceUpdate(presence, chatId);
+    } catch (error) {
+      // Presence is best-effort — a failure here must never surface as a 500 on the direct typing
+      // endpoint or MCP tool (mirrors the whatsapp-web.js adapter; #583 R4). A migrated contact can
+      // yield `No LID for user` on the presence path even when the actual send succeeds.
+      this.logger.warn(`Could not set chat state '${state}' for ${chatId} (best-effort)`, String(error));
+    }
   }
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -571,6 +579,19 @@ export class BaileysAdapter implements IWhatsAppEngine {
     this.ensureReady();
     return this.sendContent(chatId, {
       contacts: { displayName: contact.name, contacts: [{ vcard: buildVCard(contact) }] },
+    });
+  }
+
+  async sendPollMessage(chatId: string, poll: PollInput): Promise<MessageResult> {
+    this.ensureReady();
+    // selectableCount 1 = single choice; 0 = no limit, which is how WhatsApp expresses
+    // "allow multiple answers". Baileys generates the poll's messageSecret itself.
+    return this.sendContent(chatId, {
+      poll: {
+        name: poll.name,
+        values: poll.options,
+        selectableCount: poll.allowMultipleAnswers ? 0 : 1,
+      },
     });
   }
 
@@ -1067,9 +1088,11 @@ export class BaileysAdapter implements IWhatsAppEngine {
     // ILocationMessage has name/address; ILiveLocationMessage does not — use the static variant only.
     let location: IncomingMessage['location'];
     if (contentType === 'locationMessage' || contentType === 'liveLocationMessage') {
-      const lm = content.locationMessage ?? content.liveLocationMessage;
+      // Read off the NORMALIZED content: an ephemeral/disappearing-chat location nests under the wrapper,
+      // so the raw `content.locationMessage` is undefined and the coordinates would be silently dropped.
+      const lm = normalized.locationMessage ?? normalized.liveLocationMessage;
       if (lm) {
-        const staticLm = content.locationMessage; // only ILocationMessage has name/address
+        const staticLm = normalized.locationMessage; // only ILocationMessage has name/address
         location = {
           latitude: lm.degreesLatitude ?? 0,
           longitude: lm.degreesLongitude ?? 0,
@@ -1232,10 +1255,11 @@ export class BaileysAdapter implements IWhatsAppEngine {
    * `onHistoryMessages` callback, harvesting `pushName` into contacts on the way (history `contacts`
    * carry no names) and seeding each chat's last-message preview.
    */
-  private captureHistoryMessages(messages: WAMessage[]): void {
+  private async captureHistoryMessages(messages: WAMessage[]): Promise<void> {
     if (!messages.length) {
       return;
     }
+    const b = await this.loadLib();
     const nameUpdates: { id: string; notify: string }[] = [];
     const mapped: IncomingMessage[] = [];
     for (const msg of messages) {
@@ -1248,7 +1272,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
       // Seed the chat's last-message preview + sort time (newest wins); else history-only chats
       // would read "No messages yet".
       this.sessionStore.recordMessage(msg);
-      const incoming = this.mapHistoryMessage(msg);
+      const incoming = this.mapHistoryMessage(b, msg);
       if (incoming) {
         mapped.push(incoming);
       }
@@ -1296,26 +1320,26 @@ export class BaileysAdapter implements IWhatsAppEngine {
    * messages would be ruinous; the type is kept, the payload dropped). Returns null for protocol /
    * reaction / key / empty messages, which carry nothing for the chat view.
    */
-  private mapHistoryMessage(msg: WAMessage): IncomingMessage | null {
-    const content = msg.message;
-    if (!content || !msg.key?.remoteJid || !msg.key.id) {
+  private mapHistoryMessage(b: typeof BaileysLib, msg: WAMessage): IncomingMessage | null {
+    const raw = msg.message;
+    if (!raw || !msg.key?.remoteJid || !msg.key.id) {
       return null;
     }
-    const contentType = Object.keys(content)[0];
+    // Unwrap ephemeral/viewOnce/documentWithCaption/edited wrappers so the real type and body surface —
+    // else a disappearing-chat message maps to type 'unknown' with an empty body. Identity no-op when
+    // already unwrapped. Derive ONE contentType from the normalized content for both the skip-filter and
+    // the type mapping, and reuse extractBaileysBody (the same body extraction the live path uses).
+    const content = b.normalizeMessageContent(raw) ?? raw;
+    const contentType = b.getContentType(content);
     if (
+      !contentType ||
       contentType === 'protocolMessage' ||
       contentType === 'reactionMessage' ||
       contentType === 'senderKeyDistributionMessage'
     ) {
       return null;
     }
-    const body =
-      content.conversation ??
-      content.extendedTextMessage?.text ??
-      content.imageMessage?.caption ??
-      content.videoMessage?.caption ??
-      content.documentMessage?.caption ??
-      '';
+    const body = extractBaileysBody(content);
     return buildIncomingMessageFromBaileys(
       {
         id: msg.key.id,

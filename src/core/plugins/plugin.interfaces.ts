@@ -8,6 +8,11 @@ import type { MessageResponseDto } from '../../modules/message/dto';
 import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import type { PluginNetRequestInit, PluginNetResponse } from './plugin-net';
 import type { HandoverState } from '../../modules/integration/entities/conversation-mapping.entity';
+import type { WebhookRequest, WebhookResponse, WebhookHandler } from './sandbox/worker-webhooks';
+
+// Re-export the ingress webhook types on the public SDK surface so plugin authors can type their
+// handler without importing from sandbox internals.
+export type { WebhookRequest, WebhookResponse, WebhookHandler };
 
 // ============================================================================
 // Plugin Types
@@ -85,8 +90,9 @@ export interface PluginManifest {
 
   // Outbound-HTTP host allowlist for `ctx.net.fetch` (requires the `net:fetch` permission). Each
   // entry is `host:port` (exact) or a bare `host` (any port); `'*'` allows any public host. Absent /
-  // empty = deny all. The SSRF guard still blocks internal IPs regardless of this list.
-  net?: { allow?: string[] };
+  // empty = deny all. `allowConfigHosts` additionally admits the host of each named config key (e.g. an
+  // operator-set base URL), resolved at fetch time. The SSRF guard still blocks internal IPs regardless.
+  net?: { allow?: string[]; allowConfigHosts?: string[] };
 
   // Localized dashboard text (name/description/config field titles) per locale code. English is the
   // base manifest + fallback. Dashboard-only; does not affect runtime behavior.
@@ -209,7 +215,7 @@ export interface ConversationSendEnvelope {
   sessionId?: string;
   instanceId?: string;
   chatId?: string;
-  type: 'text' | 'image' | 'file' | 'audio' | 'video' | 'location';
+  type: 'text' | 'image' | 'file' | 'audio' | 'video' | 'voice' | 'location';
   text?: string;
   mediaUrl?: string;
   replyTo?: string;
@@ -273,6 +279,19 @@ export interface PluginEngineReadCapability {
   getContactById(sessionId: string, contactId: string): ReturnType<IWhatsAppEngine['getContactById']>;
   checkNumberExists(sessionId: string, phone: string): ReturnType<IWhatsAppEngine['checkNumberExists']>;
   getChats(sessionId: string): ReturnType<IWhatsAppEngine['getChats']>;
+  /** Recent messages for a chat (both directions), for history backfill. `limit` is clamped host-side. */
+  getChatHistory(
+    sessionId: string,
+    chatId: string,
+    limit?: number,
+    includeMedia?: boolean,
+  ): ReturnType<IWhatsAppEngine['getChatHistory']>;
+  /**
+   * Canonical (neutral) form of a chat id: resolves a `@lid` privacy id to its stable `<phone>@c.us`
+   * when the lid->phone mapping is known, and otherwise returns the id unchanged. Lets a plugin key a
+   * chat by one identity across WhatsApp's `@lid` migration (best-effort; an unresolved lid stays `@lid`).
+   */
+  canonicalChatId(sessionId: string, chatId: string): Promise<string>;
 }
 
 /** Outbound HTTP for a plugin — always through the host SSRF guard, scoped to `manifest.net.allow`. */
@@ -291,6 +310,24 @@ export interface PluginConversationsCapability {
  */
 export interface PluginHandoverCapability {
   set(key: { sessionId: string; chatId: string; instanceId: string }, state: HandoverState): Promise<unknown>;
+}
+
+/**
+ * Plugin-facing conversation mapping: create/read the WA-chat <-> provider-conversation link an adapter
+ * needs so handover.set and conversation.send({source}) can resolve. Reuses the `conversation:send`
+ * permission — owning the mapping is part of owning the conversation.
+ */
+export interface PluginMappingsCapability {
+  upsert(key: { sessionId: string; chatId: string; instanceId: string }, providerConversationId: string): Promise<void>;
+  get(key: {
+    sessionId: string;
+    chatId: string;
+    instanceId: string;
+  }): Promise<{ providerConversationId: string; handoverState: HandoverState } | null>;
+  getByProvider(
+    instanceId: string,
+    providerConversationId: string,
+  ): Promise<{ sessionId: string; chatId: string; handoverState: HandoverState } | null>;
 }
 
 // ============================================================================
@@ -317,6 +354,10 @@ export interface PluginContext {
   // Register a hook handler
   registerHook: (event: HookEvent, handler: HookHandler, priority?: number) => void;
 
+  // Claim an inbound ingress webhook route (requires the `webhook:ingress` permission). Delivered only
+  // to sandboxed plugins via the ingress pipeline; in-process built-ins cannot receive ingress.
+  registerWebhook: (route: string, handler: WebhookHandler) => void;
+
   // Curated write surface — routes through MessageService (persistence preserved).
   messages: PluginMessagingCapability;
 
@@ -331,6 +372,9 @@ export interface PluginContext {
 
   // Flip a mapped conversation's bot/human/closed handover state. Requires `conversation:send`.
   handover: PluginHandoverCapability;
+
+  // Create/read the WA-chat <-> provider-conversation mapping. Requires `conversation:send`.
+  mappings: PluginMappingsCapability;
 }
 
 export interface PluginLogger {

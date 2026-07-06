@@ -435,7 +435,7 @@
   border: 1px solid rgba(251, 191, 36, 0.3);
   border-radius: 8px;
   margin-bottom: 1.5rem;
-  color: #d97706;
+  color: var(--warning);
   font-size: 0.875rem;
 }
 
@@ -637,7 +637,7 @@
   left: 0;
   right: 0;
   bottom: 0;
-  background-color: #cbd5e1;
+  background-color: var(--border);
   transition: 0.3s;
   border-radius: 26px;
 }

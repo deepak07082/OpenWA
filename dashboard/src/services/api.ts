@@ -140,8 +140,10 @@ export const MESSAGE_TYPES = [
   'sticker',
   'location',
   'contact',
+  'poll',
   'call',
   'revoked',
+  'masked',
   'unknown',
 ] as const;
 export type MessageType = (typeof MESSAGE_TYPES)[number];

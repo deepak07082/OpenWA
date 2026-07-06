@@ -487,7 +487,7 @@ describe('BaileysAdapter capability gating', () => {
   });
 });
 
-describe('BaileysAdapter location + contact sends', () => {
+describe('BaileysAdapter location + contact + poll sends', () => {
   beforeEach(() => {
     fakeSock.user = { id: '628999:1@s.whatsapp.net', name: 'Me' };
     fakeSock.resetEmitter();
@@ -536,6 +536,26 @@ describe('BaileysAdapter location + contact sends', () => {
     const vcard = call.contacts.contacts[0].vcard;
     expect(vcard).not.toMatch(/\nEMAIL:evil@x\.com/);
     expect(vcard).toContain('FN:Eve EMAIL:evil@x.com');
+  });
+
+  it('sendPollMessage maps name/values and defaults to single choice (selectableCount 1)', async () => {
+    const adapter = await ready();
+    await adapter.sendPollMessage('120363000@g.us', { name: 'Where?', options: ['Park', 'Beach'] });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith('120363000@g.us', {
+      poll: { name: 'Where?', values: ['Park', 'Beach'], selectableCount: 1 },
+    });
+  });
+
+  it('sendPollMessage uses selectableCount 0 (no limit) when multiple answers are allowed', async () => {
+    const adapter = await ready();
+    await adapter.sendPollMessage('120363000@g.us', {
+      name: 'Toppings?',
+      options: ['Cheese', 'Ham', 'Olives'],
+      allowMultipleAnswers: true,
+    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith('120363000@g.us', {
+      poll: { name: 'Toppings?', values: ['Cheese', 'Ham', 'Olives'], selectableCount: 0 },
+    });
   });
 });
 
@@ -611,6 +631,12 @@ describe('BaileysAdapter messaging', () => {
     expect(fakeSock.sendPresenceUpdate).toHaveBeenCalledWith('composing', '628111@s.whatsapp.net');
   });
 
+  it('sendChatState swallows a presence failure (best-effort, mirrors wwjs) (#583 R4)', async () => {
+    const adapter = await readyAdapter();
+    fakeSock.sendPresenceUpdate.mockRejectedValueOnce(new Error('No LID for user'));
+    await expect(adapter.sendChatState('628111@s.whatsapp.net', 'typing')).resolves.toBeUndefined();
+  });
+
   it('messaging methods throw EngineNotReadyError before the connection is open', async () => {
     const adapter = newAdapter();
     await adapter.initialize({});
@@ -658,6 +684,64 @@ describe('BaileysAdapter inbound fan-out', () => {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
     const msg = onMessage.mock.calls[0][0] as { id: string; body: string; type: string; fromMe: boolean };
     expect(msg).toMatchObject({ id: 'IN1', body: 'hi there', type: 'text', fromMe: false });
+  });
+
+  it('extracts coordinates from an ephemeral (disappearing) location message', async () => {
+    const onMessage = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize({ onMessage });
+    const inner = {
+      locationMessage: { degreesLatitude: 24.1, degreesLongitude: 55.2, name: 'Office', address: '1 Main St' },
+    };
+    baileys.getContentType.mockReturnValue('locationMessage');
+    baileys.normalizeMessageContent.mockReturnValue(inner); // unwrap the ephemeral wrapper
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          key: { remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'LOC1' },
+          message: { ephemeralMessage: { message: inner } }, // wrapped location
+          messageTimestamp: 1700000002,
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const msg = onMessage.mock.calls[0][0] as { location?: Record<string, unknown> };
+    expect(msg.location).toMatchObject({
+      latitude: 24.1,
+      longitude: 55.2,
+      description: 'Office',
+      address: '1 Main St',
+    });
+  });
+
+  it('maps an ephemeral-wrapped history message to its real type and body (not unknown/empty)', async () => {
+    const onHistoryMessages = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize({ onHistoryMessages });
+    const inner = { conversation: 'disappearing hello' };
+    baileys.normalizeMessageContent.mockReturnValue(inner); // unwrap the ephemeral wrapper
+    baileys.getContentType.mockReturnValue('conversation');
+    fakeSock.fire('messaging-history.set', {
+      contacts: [],
+      chats: [],
+      messages: [
+        {
+          key: { remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'H1' },
+          message: { ephemeralMessage: { message: inner } },
+          messageTimestamp: 1700000000,
+          pushName: 'Alice',
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    expect(onHistoryMessages).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const mapped = onHistoryMessages.mock.calls[0][0] as Array<{ id: string; type: string; body: string }>;
+    expect(mapped[0]).toMatchObject({ id: 'H1', type: 'text', body: 'disappearing hello' });
   });
 
   it('surfaces inbound @mentions as neutral mentionedIds (contextInfo.mentionedJid)', async () => {

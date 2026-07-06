@@ -7,6 +7,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The **"Install a plugin" modal is wider on desktop** (480px → 680px) to give the plugin catalog list more room, while still collapsing to a full-width bottom sheet on small screens.
+
+### Fixed
+
+- **The dark theme now covers every dashboard surface.** A number of components used hardcoded colors instead of the theme's CSS variables, so several surfaces stayed light in dark mode — most visibly the Infrastructure "Database Migrations" card, plus status/severity badges, toasts, danger-hover states, and toggle tracks across most pages. They now use the theme tokens (and translucent semantic fills) so they follow the active theme in both light and dark. A new `--info` token themes the blue badges (permission, SQLite, info logs, qr-ready pill) that previously had no theme-aware color, and the root `<html>` background no longer stays white when the dark theme is selected on a light-OS device (visible on overscroll).
+
+## [0.8.8] - 2026-07-05
+
+### Added
+
+- **Native WhatsApp polls** via `POST /api/sessions/:sessionId/messages/send-poll`: question, 2–12 options and an optional `allowMultipleAnswers` flag (default single choice), implemented on both engines (whatsapp-web.js `Poll`, Baileys `poll` content with `selectableCount` 1/0). The message history stores the poll question as the body so the log stays readable. Polls are a first-class `poll` message type end to end — both engines map incoming poll messages to it, so the websocket/webhook events, persisted rows, and dashboard all report `poll` consistently. Thanks @alejo117.
+
+### Changed
+
+- Corrected the Italian login-footer wording. Thanks @albanobattistella.
+
+### Fixed
+
+- **`GET /api/sessions/:sessionId/channels/:channelId/messages` always returned an empty array** on the whatsapp-web.js engine (#625). The adapter called `client.getChannelById()`, which does not exist in whatsapp-web.js 1.34.x, so every call threw and the error was swallowed into `[]`. Channel messages are now read from the subscribed `Channel` instance (via `getChannels()`), and an unknown/unsubscribed channel returns a `404` (`ChannelNotFoundError`) instead of a silent empty `200` — matching `GET /channels/:channelId`. Thanks @Header9968.
+- **A session whose `engine.initialize()` fails no longer orphans its browser process.** The crash-recovery path in `SessionService.start()` was tearing down the half-built engine with a graceful `destroy()`, but a failed `initialize()` usually means the underlying browser/CDP connection is already broken (e.g. a `TargetCloseError: Target closed` mid-injection) — `destroy()` has nothing live to talk to, so it could only time out after 10s via `teardownEngineSafely`'s race, leaving the Chromium process alive and orphaned. Every such crash left one more orphaned process behind, eventually starving the host of memory. It now uses `forceDestroy()` (the same SIGKILL-the-process recovery `POST /:id/force-kill` uses), since a failed initialize is the same "possibly-unreachable engine" state that exists for.
+- **Authenticated HTTP/HTTPS proxies now work** on the whatsapp-web.js engine (#628). Credentials were passed inside `--proxy-server`, which Chromium ignores, so a proxy with a username/password never authenticated (only IP-authorized proxies worked). The username/password are now handed to whatsapp-web.js's `proxyAuthentication` (which drives Chromium's `page.authenticate`) while `--proxy-server` gets a credential-less URL. SOCKS proxies still cannot be authenticated — Chromium does not support SOCKS proxy authentication at all — so a SOCKS proxy carrying credentials now logs a clear warning instead of failing with an opaque navigation timeout. Thanks @gudge25.
+
+## [0.8.7] - 2026-07-03
+
+### Added
+
+- **Plugins can canonicalize a chat id** via a new `ctx.engine.canonicalChatId(sessionId, chatId)` capability, gated by the `engine:read` permission like the other engine reads. It resolves a `@lid` privacy id to its stable `<phone>@c.us` form when the mapping is known (best-effort; an unresolved id passes through), letting a plugin key a chat by one identity across WhatsApp's `@lid` migration. This is the host-side prerequisite for an adapter to keep a contact's conversation from splitting when they migrate to `@lid`. (#615)
+
+## [0.8.6] - 2026-07-03
+
+### Fixed
+
+
+- **The `engine.getChatHistory` plugin capability (added in 0.8.5) now reaches sandboxed plugins.** It was wired only into the host-side context, not the plugin-worker bridge, so a sandboxed plugin's `ctx.engine.getChatHistory` was `undefined` and the call failed silently. It is now bridged through the worker capability + router like the other engine reads. Historical messages from the whatsapp-web.js engine also carry location coordinates and quoted-message references now, matching the live message path (previously a backfilled location rendered empty and replies lost their thread link). (#609)
+
+## [0.8.5] - 2026-07-03
+
+### Added
+
+- **Plugins can read recent chat history** via a new `ctx.engine.getChatHistory(sessionId, chatId, limit?, includeMedia?)` capability, gated by the `engine:read` permission and the plugin's active-session scope like the other engine reads. The limit is clamped host-side (max 100), and both message directions are returned. This is the host-side prerequisite for an adapter to backfill prior conversation context. (#609)
+
+## [0.8.4] - 2026-07-03
+
+### Added
+
+- **`CSP_UPGRADE_INSECURE_REQUESTS` env var** to control the CSP `upgrade-insecure-requests` directive. It defaults to the existing behaviour (on in production, off elsewhere); set it to `false` for an HTTP-only deployment on a trusted private network, where the browser would otherwise upgrade the dashboard to `https` and make it unreachable. Set it to `true` to force it on. (#611)
+
+## [0.8.3] - 2026-07-03
+
+### Added
+
+- **Plugins can send WhatsApp voice notes through `ctx.conversations.send`.** A new `voice` envelope type sends the media at `mediaUrl` as a PTT voice note (audio bubble with waveform) rather than a plain audio file — the host maps it to an audio send with `ptt` set, which defaults the codec to `audio/ogg; codecs=opus` and classifies the message as `voice`, matching inbound classification. It rides the same `conversation:send` permission and activated-session scope as the other media types. (#607)
+
+## [0.8.2] - 2026-07-03
+
+### Added
+
+- **Plugins can send media through `ctx.conversations.send`.** The conversation-send capability now accepts `image`, `video`, `audio`, and `file` envelopes that carry a `mediaUrl`, sending them by URL through the same media pipeline as the REST media endpoints (the caption comes from `text`). It stays under the existing `conversation:send` permission and the plugin's activated-session scope — the text/reply behavior is unchanged. A `replyTo` on a media envelope is rejected, since the engine media path cannot quote a message.
+- **Official Java SDK (`com.rmyndharis:openwa`).** A hand-written, synchronous Java 17 client covering the full REST surface — all 12 resources (sessions, messages, contacts, groups, webhooks, chats, labels, channels, catalog, status, templates, health) plus API-key validation — with typed request builders, immutable response records, a typed error hierarchy, and an injectable HTTP transport for testing. One runtime dependency (Gson); published to Maven Central as `com.rmyndharis:openwa:0.1.1`. Lives in `sdk/java` and is drift-tested against the backend DTOs like the JavaScript, Python, and PHP SDKs. (#602)
+
+## [0.8.1] - 2026-07-02
+
+### Changed
+
+- ⚠️ **The WebSocket handshake no longer accepts the API key via the `?apiKey=` query string.** A key in the URL leaks into proxy and access logs. The handshake now accepts the key only via the Socket.IO `auth.apiKey` field (recommended) or the `X-API-Key` header. **Migration:** if a client connected with `io(url + '?apiKey=...')`, switch to `io(url, { auth: { apiKey } })` or send the `X-API-Key` header. (#601)
+- ⚠️ **The MCP server now defaults to read-only.** Write (state-changing) tools are exposed only when `MCP_READONLY=false` is set explicitly; previously an unset `MCP_READONLY` defaulted to read-write, so enabling `MCP_ENABLED` silently exposed message-send and group tools. **Migration:** set `MCP_READONLY=false` to keep write tools available to MCP callers. (#601)
+
+### Security
+
+- **SSRF rejection messages no longer disclose the resolved internal IP address.** A blocked outbound URL (media-by-URL send, webhook registration) returned the guard's raw message, which named the internal address it resolved to — a reconnaissance oracle. The client now receives a generic message and the detail is logged server-side only. (#595)
+- **Imported session names are validated against path traversal.** A session name becomes the engine's on-disk auth-directory key, and the data-import path bypassed the normal validation, so a crafted name could escape the intended directory. Session-name safety is now enforced at the engine sink for every code path, and the importer skips (with a warning) any unsafe name. Save-config and storage-export responses also return relative paths instead of absolute host paths. (#598)
+- **Plugin capability calls are confined to the sessions a plugin is activated for.** Capability calls (send, engine reads, conversation send, handover, mappings) were gated only by the plugin's static manifest scope, so a plugin activated for one session could act on another. They now also honor the operator-set per-session activation. Plugin `net.fetch` is additionally bounded by a global concurrency limit so many concurrent fetches can't exhaust host memory. (#594)
+- **Inbound-webhook signature verification and config-secret handling hardened.** The HMAC signed content is reconstructed without interpreting `$`-substitution sequences (a body containing one no longer fails verification), the challenge token is compared in constant time, plugin config-secret redaction fails closed when a schema is unavailable and masks nested secrets, and a masked secret round-tripped from the UI no longer overwrites the stored value. (#592, #593)
+- **Rejected WebSocket authentication attempts are now audited** with the same event the REST guard emits, so credential probing over the WebSocket surface leaves a forensic trail. (#601)
+
+### Fixed
+
+- **Inbound-webhook (Integration Fabric) idempotency and delivery durability.** The dedup key now includes the plugin id (two plugins sharing an instance id no longer drop each other's deliveries); a delivery with no dedup header derives a deterministic id instead of a random one (so a provider retry dedups rather than duplicating a WhatsApp send); a redrive keeps a DLQ row redrivable when an inline dispatch is swallowed rather than marking it handled; and the conversation-mapping upsert is race-safe. (#591)
+- **Disappearing-chat (ephemeral) inbound messages on the Baileys engine.** Location coordinates are no longer dropped for an ephemeral location message, and ephemeral/view-once-wrapped messages in a history sync now map to their real type and body instead of an empty "unknown". (#596)
+- **A failed engine start no longer wedges a session.** If engine initialization fails, the half-built engine is now torn down and evicted instead of being left behind holding a concurrency slot and blocking restarts. Creating a session whose name loses a race to an identical one returns 409 Conflict instead of a 500, and bulk send now caps the number of concurrently-processing batches held in memory (`BULK_MAX_CONCURRENT_BATCHES`). (#600)
+- **PostgreSQL boot on managed instances.** The UUID-defaults migration no longer runs `CREATE EXTENSION pgcrypto` unconditionally — it is a core built-in on PostgreSQL 13+, and requiring the extension crash-looped startup on managed databases where the role can't create it. The extension is now touched only on PostgreSQL ≤ 12, with a clear error if it's genuinely needed and unavailable. (#599)
+- **The migration CLI works again.** The data-source module exported two `DataSource` instances, which the TypeORM CLI rejects, breaking every `migration:*` command. (#590)
+
+## [0.8.0] - 2026-07-02
+
+### Added
+
+- **Integration Fabric: provision and connect external services to WhatsApp sessions.** ADMIN operators can mint per-plugin instances — one per external account — through a provisioning API and a new dashboard **Instances** tab, each with its own HMAC-verified inbound webhook endpoint, operator-set secret, and per-session configuration. Integration plugins gain the capabilities needed to build a two-way bridge: `ctx.registerWebhook` to receive that inbound traffic, `ctx.mappings` to correlate a WhatsApp chat with an external conversation, a session-and-chat-scoped handover gate so a chat handed to a human is withheld from the owning plugin while the bot and other plugins still receive it, and `net.allowConfigHosts` to permit an outbound request to a host drawn from the instance's own configuration. This is the foundation for provider adapters. (#568, #570, #571, #575, #585, #587, #588, #589)
+
+### Fixed
+
+- **Replying to and forwarding to a LID-migrated contact no longer fail with HTTP 500 on the whatsapp-web.js engine.** These paths sent to the phone id (`@c.us`) like the original send bug (#573), so a contact WhatsApp had migrated to `@lid` rejected them with `No LID for user`. They now resolve the recipient the same way as a normal send (including the self-heal retry), and a forward reads back its delivered id from the resolved chat so delivery status still reconciles. (#583)
+- **The typing/presence endpoint no longer returns HTTP 500 on the Baileys engine when a presence update fails.** Presence is best-effort; a failure (e.g. `No LID for user` for a migrated contact) is now caught and logged at `WARN` and the request succeeds, matching the whatsapp-web.js engine. This also covers the presence agent tool. (#583)
+- **Chat history for a LID-migrated contact is no longer split across two entries on the whatsapp-web.js engine.** The engine now records the `phone ↔ lid` mapping it learns (when resolving a send, and when resolving an inbound `@lid` sender's number), so the messages API bridges a contact's `@c.us` and `@lid` rows into one conversation — previously only the Baileys engine populated this mapping. (#583)
+- **The dashboard chat list no longer refetches on every message sent to a LID-migrated contact.** The outgoing echo can arrive addressed as `@lid` while the open chat is `@c.us`; the sent message is already shown via the send response, so the sidebar no longer triggers a full reload for an outgoing echo with no matching chat. (#583)
+
+## [0.7.20] - 2026-07-02
+
+### Fixed
+
+- **Sends to a LID-migrated contact no longer intermittently fail with HTTP 500 on the whatsapp-web.js engine.** The v0.7.19 fix resolves such a contact's phone id to its `@lid` before sending, but that resolution is a WhatsApp Web round-trip that occasionally throws an internal error — in which case the send fell back to the phone id and hit `No LID for user` again, so the message tester (and the API) still returned a 500 now and then. The engine now caches each contact's confirmed resolution for the session (both a migrated `@lid` and a confirmed non-migrated `@c.us`), so a later flaky resolution reuses the known-good id and ordinary contacts are not re-probed on every send. If a send still fails with `No LID for user` — e.g. a contact that migrates mid-session — the engine drops the stale mapping, re-resolves once, and retries. (#580) Thanks @lexcorp.
+- **The typing indicator no longer logs a misleading `ERROR` when sending to a LID-migrated contact.** The best-effort "typing…" presence step is already caught and never affects the send, but a failed attempt (`No LID for user`) was logged at `ERROR`, which read as a fault even though nothing broke. It now logs at `WARN` and the typing target is resolved the same way as the send. (#582) Thanks @lexcorp.
+
+## [0.7.19] - 2026-07-02
+
+### Added
+
+- **Business messages WhatsApp masks on linked devices are now surfaced as a `masked` type instead of an empty bubble.** For some high-security business messages (e.g. enterprise OTPs), WhatsApp delivers only a bodyless placeholder to linked/companion devices — the actual text is withheld by design and is only readable on the primary phone. On the Baileys engine these previously arrived as `type: "unknown"` with a blank body, which looked like a parsing bug. They are now classified as `type: "masked"` (with an empty body) so the API, webhooks, and filters can distinguish them, and the dashboard shows a short notice explaining the message is only available on the primary phone. (#574) Thanks @crossgg.
+
+### Fixed
+
+- **Sending to a contact WhatsApp has migrated to LID addressing no longer fails with HTTP 500 on the whatsapp-web.js engine.** WhatsApp has begun addressing some individual chats by privacy id (`@lid`) instead of the phone-number WID (`@c.us`); for those contacts whatsapp-web.js rejected the send with `No LID for user`, which surfaced as a 500 (and as a passed-through 500 in integrations such as n8n). Pinning the WhatsApp Web version did not help because this is an addressing change, not version drift. The engine now resolves an individual recipient to its current WhatsApp id before sending — across text, media (image/video/audio/document), location, contact, and sticker messages, plus the typing indicator — and falls back to the original id if resolution is unavailable, so a send is never blocked on it. Group and channel sends are unaffected; the Baileys engine already handled this. (#573) Thanks @lexcorp.
+
 ## [0.7.18] - 2026-07-02
 
 ### Added

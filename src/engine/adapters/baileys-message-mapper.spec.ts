@@ -24,8 +24,15 @@ describe('mapBaileysMessageType (baileys content-type -> neutral MessageType)', 
     ['buttonsMessage', false, 'text'],
     ['templateMessage', false, 'text'],
     ['interactiveResponseMessage', false, 'text'],
+    // Meta masks high-security business messages (enterprise OTPs) on linked/companion devices,
+    // delivering a bodyless `placeholderMessage` (PlaceholderType MASK_LINKED_DEVICES). Surface it as
+    // its own `masked` type so it is distinguishable from a genuinely unparseable message (#574).
+    ['placeholderMessage', false, 'masked'],
     [undefined, false, 'unknown'],
-    ['pollCreationMessage', false, 'unknown'],
+    // Native polls surface as their own `poll` type (WhatsApp bumps the content key across versions).
+    ['pollCreationMessage', false, 'poll'],
+    ['pollCreationMessageV2', false, 'poll'],
+    ['pollCreationMessageV3', false, 'poll'],
     // Regression trap: calls arrive via the `call` socket event, never as a message content type,
     // so any call-ish token must stay 'unknown' (no accidental mapping).
     ['callLogMessage', false, 'unknown'],

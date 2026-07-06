@@ -55,8 +55,12 @@ export type MessageType =
   | 'sticker'
   | 'location'
   | 'contact'
+  | 'poll'
   | 'call'
   | 'revoked'
+  // A message WhatsApp deliberately withheld from linked/companion devices (e.g. high-security
+  // business OTPs): the payload is absent by design, not unparseable. See `mapBaileysMessageType`.
+  | 'masked'
   | 'unknown';
 
 export interface IncomingMessage {
@@ -201,6 +205,15 @@ export interface LocationInput {
   longitude: number;
   description?: string;
   address?: string;
+}
+
+export interface PollInput {
+  /** Poll question / title. */
+  name: string;
+  /** Options to vote on (WhatsApp accepts between 2 and 12). */
+  options: string[];
+  /** When true a voter can pick several options; default is single choice. */
+  allowMultipleAnswers?: boolean;
 }
 
 export interface ReactionSender {
@@ -438,6 +451,7 @@ export interface IWhatsAppEngine {
   sendLocationMessage(chatId: string, location: LocationInput): Promise<MessageResult>;
   sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult>;
   sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult>;
+  sendPollMessage(chatId: string, poll: PollInput): Promise<MessageResult>;
 
   // Reply & Forward
   replyToMessage(chatId: string, quotedMsgId: string, text: string): Promise<MessageResult>;

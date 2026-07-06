@@ -71,7 +71,46 @@ describe('verifyIngressSignature', () => {
     );
   });
 
+  it('accepts a legitimately-signed body containing $-substitution sequences (no String.replace mangling)', () => {
+    // A body with $&, $', $` , $$, $1 and even a literal {timestamp} must be HMAC'd verbatim. A naive
+    // String.replace would interpret these in the replacement and diverge the signed bytes.
+    const trickyBody = '{"a":"$& $\' $` $$ $1","b":"{timestamp}"}';
+    const r = verifyIngressSignature(spec, {
+      rawBody: trickyBody,
+      headers: { 'x-sig': sig(trickyBody) },
+      secret,
+      now: 0,
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it('accepts a timestamped body containing $-sequences with a multi-token template', () => {
+    const withTs = { ...spec, timestampHeader: 'X-Ts', toleranceSec: 300, contentTemplate: '{timestamp}.{rawBody}' };
+    const t = 1000;
+    const trickyBody = 'payload-with-$&-and-$$';
+    const signed = 'sha256=' + createHmac('sha256', secret).update(`${t}.${trickyBody}`).digest('hex');
+    const r = verifyIngressSignature(withTs, {
+      rawBody: trickyBody,
+      headers: { 'x-sig': signed, 'x-ts': String(t) },
+      secret,
+      now: (t + 10) * 1000,
+    });
+    expect(r.ok).toBe(true);
+  });
+
   it('accepts scheme "none" without a signature', () => {
     expect(verifyIngressSignature({ scheme: 'none' }, { rawBody, headers: {}, secret, now: 0 }).ok).toBe(true);
+  });
+
+  it('fails closed on an empty secret even for a structurally valid HMAC', () => {
+    const emptySecretSpec = { scheme: 'hmac-sha256' as const, header: 'x-sig' };
+    const digest = createHmac('sha256', '').update('body').digest('hex');
+    const out = verifyIngressSignature(emptySecretSpec, {
+      rawBody: 'body',
+      headers: { 'x-sig': digest },
+      secret: '',
+      now: 0,
+    });
+    expect(out.ok).toBe(false);
   });
 });

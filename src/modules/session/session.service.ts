@@ -17,6 +17,8 @@ import { Message, MessageDirection, MessageStatus } from '../message/entities/me
 import { MessageBatch } from '../message/entities/message-batch.entity';
 import { CreateSessionDto } from './dto';
 import { EngineFactory } from '../../engine/engine.factory';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { userPart } from '../../engine/identity/wa-id';
 import { paginate, ListOptions, resolveListWindow } from '../../common/utils/paginate';
 import { isUniqueConstraintError } from '../../common/utils/unique-constraint.util';
 import {
@@ -144,7 +146,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     private readonly hookManager: HookManager,
     @Optional()
     private readonly configService?: ConfigService,
-  ) { }
+    // Shared lid<->phone table (global). Used to persist an inbound @lid sender's resolved phone so
+    // an inbound-only migrated contact's `@lid` and `@c.us` rows bridge in the read-path (#583 R3 Ph2).
+    @Optional()
+    private readonly lidMappingStore?: LidMappingStoreService,
+  ) {}
 
   /**
    * On backend startup, reset all active session statuses to disconnected
@@ -278,9 +284,20 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       status: SessionStatus.CREATED,
     });
 
-    const saved = await this.dataSource.transaction(async manager => {
-      return await manager.save(session);
-    });
+    // The findOne pre-check above is a fast path for the common case, but it's a check-then-insert
+    // TOCTOU: two concurrent same-name creates both pass it, then one hits the name UNIQUE constraint.
+    // Translate that violation to a 409 (matching the pre-check) instead of leaking a raw 500.
+    let saved: Session;
+    try {
+      saved = await this.dataSource.transaction(async manager => {
+        return await manager.save(session);
+      });
+    } catch (err) {
+      if (isUniqueConstraintError(err)) {
+        throw new ConflictException(`Session with name '${dto.name}' already exists`);
+      }
+      throw err;
+    }
     this.logger.log(`Session created: ${saved.name}`, {
       sessionId: saved.id,
       action: 'create',
@@ -433,7 +450,29 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       const { maxAttempts, baseDelay } = resolveReconnectConfig(session.config);
       this.reconnectStates.set(id, { attempts: 0, timer: null, maxAttempts, baseDelay });
 
-      await this.initializeEngine(id, session);
+      try {
+        await this.initializeEngine(id, session);
+      } catch (err) {
+        // engine.initialize() failed AFTER the engine was registered (initializeEngine sets it before
+        // initializing). Evict + tear it down so the session doesn't wedge at "already started" with a
+        // leaked Chromium/socket permanently holding a concurrency slot. initializingSessions serializes
+        // start(), so the engine in the map here is the one this start just created.
+        //
+        // Use forceDestroy(), not destroy(): initialize() failing usually means the underlying
+        // browser/CDP connection is already broken (e.g. a "Target closed" crash mid-injection), so
+        // a graceful destroy() has nothing live to talk to — it can only time out via
+        // teardownEngineSafely's race, after which the orphaned Chromium process is never actually
+        // killed. forceDestroy() SIGKILLs the OS process directly, the same recovery force-kill uses
+        // for a wedged engine, which is exactly the state this catch block is handling.
+        const orphan = this.engines.get(id);
+        if (orphan) {
+          this.engines.delete(id);
+          this.sessionErrors.set(id, err instanceof Error ? err.message : String(err));
+          await this.teardownEngineSafely(id, orphan, e => e.forceDestroy(), 'force-destroy');
+          await this.updateStatus(id, SessionStatus.FAILED).catch(() => undefined);
+        }
+        throw err;
+      }
 
       // A stop()/delete() may have landed while we awaited engine.initialize() — if so, tear down the
       // engine we just registered so the session isn't resurrected to READY (mirrors the post-init
@@ -1448,6 +1487,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       }
     }
     this.lidPhoneCache.set(key, phone);
+    // Persist a real @lid -> phone resolution so the read-path can bridge this contact's `@lid` and
+    // `@c.us` rows even when the operator never sent to them (#583 R3 Phase 2). Reuses the resolution
+    // above — no extra network call — and is fire-and-forget so dispatch never blocks/fails on it.
+    if (phone) {
+      void this.lidMappingStore?.remember(userPart(contactId), phone, sessionId)?.catch(() => {});
+    }
     return phone;
   }
 

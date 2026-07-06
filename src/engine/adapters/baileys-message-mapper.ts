@@ -32,6 +32,11 @@ export function mapBaileysMessageType(contentType: string | undefined, isPtt = f
     case 'contactMessage':
     case 'contactsArrayMessage':
       return 'contact';
+    case 'pollCreationMessage':
+    case 'pollCreationMessageV2':
+    case 'pollCreationMessageV3':
+      // Native polls; WhatsApp bumps the content key across versions, all map to the same neutral type.
+      return 'poll';
     case 'interactiveMessage':
     case 'buttonsMessage':
     case 'templateMessage':
@@ -40,6 +45,13 @@ export function mapBaileysMessageType(contentType: string | undefined, isPtt = f
       // carry display text that {@link extractBaileysBody} flattens into `body`, so they surface as
       // `text` instead of being dropped as `unknown` with an empty body (#562).
       return 'text';
+    case 'placeholderMessage':
+      // Meta masks high-security business messages (enterprise OTPs, banking alerts) on linked/
+      // companion devices — which Baileys is — delivering a bodyless `placeholderMessage` (its only
+      // PlaceholderType is MASK_LINKED_DEVICES). The text is withheld by design and never arrives on
+      // this device (a resend cannot recover it), so surface it as its own `masked` type rather than
+      // an indistinguishable `unknown` empty bubble, so clients can explain it (#574).
+      return 'masked';
     default:
       return 'unknown';
   }

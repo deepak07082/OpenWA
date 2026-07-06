@@ -11,7 +11,7 @@ import { HookManager } from '../../core/hooks';
 import { TemplateService } from '../template/template.service';
 import { renderTemplate } from '../../common/utils/template-render';
 import { createLogger } from '../../common/services/logger.service';
-import { SsrfBlockedError } from '../../common/security/ssrf-guard';
+import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
 import { userPart } from '../../engine/identity/wa-id';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 
@@ -421,6 +421,34 @@ export class MessageService {
     return this.persistSentState(message, result);
   }
 
+  async sendPoll(
+    sessionId: string,
+    dto: { chatId: string; name: string; options: string[]; allowMultipleAnswers?: boolean },
+  ): Promise<MessageResponseDto> {
+    const engine = this.getEngine(sessionId);
+
+    // Save message as pending BEFORE sending. A poll has no plain-text body, so store the
+    // question — that keeps the message history readable.
+    const message = await this.saveOutgoingMessage(sessionId, {
+      chatId: dto.chatId,
+      body: `📊 ${dto.name}`,
+      type: 'poll',
+    });
+
+    let result: MessageResult;
+    try {
+      result = await engine.sendPollMessage(dto.chatId, {
+        name: dto.name,
+        options: dto.options,
+        allowMultipleAnswers: dto.allowMultipleAnswers === true,
+      });
+    } catch (error) {
+      await this.saveFailedMessage(message);
+      throw this.toClientFacingError(error);
+    }
+    return this.persistSentState(message, result);
+  }
+
   async sendSticker(sessionId: string, dto: SendMediaMessageDto): Promise<MessageResponseDto> {
     const engine = this.getEngine(sessionId);
     const media = this.buildMediaInput(dto);
@@ -680,11 +708,13 @@ export class MessageService {
   /**
    * Map a blocked outbound media fetch (SSRF guard) to an HTTP 400 so a
    * caller-supplied internal/unsafe URL returns a client error instead of a 500.
-   * All other errors pass through unchanged.
+   * The raw guard message names the resolved internal IP (a recon/DNS-rebind oracle), so return a
+   * generic message to the client and keep the detail in the server log only. Others pass through.
    */
   private toClientFacingError(error: unknown): unknown {
     if (error instanceof SsrfBlockedError) {
-      return new BadRequestException(error.message);
+      this.logger.warn(`Outbound media fetch blocked by SSRF guard: ${error.message}`);
+      return new BadRequestException(SSRF_BLOCKED_CLIENT_MESSAGE);
     }
     return error;
   }

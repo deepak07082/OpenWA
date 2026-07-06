@@ -23,6 +23,7 @@ function createMockEngine() {
     sendStickerMessage: jest.fn().mockResolvedValue(mockEngineResult),
     sendLocationMessage: jest.fn().mockResolvedValue(mockEngineResult),
     sendContactMessage: jest.fn().mockResolvedValue(mockEngineResult),
+    sendPollMessage: jest.fn().mockResolvedValue(mockEngineResult),
     replyToMessage: jest.fn().mockResolvedValue(mockEngineResult),
     forwardMessage: jest.fn().mockResolvedValue(mockEngineResult),
     reactToMessage: jest.fn().mockResolvedValue(undefined),
@@ -333,12 +334,15 @@ describe('MessageService', () => {
       );
     });
 
-    it('maps a blocked-media-URL SSRF error to HTTP 400', async () => {
-      mockEngine.sendImageMessage.mockRejectedValueOnce(new SsrfBlockedError('Blocked internal address: 127.0.0.1'));
+    it('maps a blocked-media-URL SSRF error to HTTP 400 with a generic message (no internal IP leak)', async () => {
+      mockEngine.sendImageMessage.mockRejectedValueOnce(
+        new SsrfBlockedError('Host x resolves to a blocked internal address: 169.254.169.254'),
+      );
 
+      // Generic client message — the resolved internal IP must NOT reach the caller (recon oracle).
       await expect(
         service.sendImage('sess-1', { chatId: '628123456789@c.us', url: 'http://127.0.0.1/x.png' }),
-      ).rejects.toBeInstanceOf(BadRequestException);
+      ).rejects.toMatchObject({ response: { message: 'Destination address is not allowed' } });
     });
 
     it('rejects a base64 image over the media cap before sending or persisting', async () => {
@@ -625,6 +629,43 @@ describe('MessageService', () => {
       expect(mockEngine.sendContactMessage).toHaveBeenCalledWith(
         'test@c.us',
         expect.objectContaining({ name: 'John Doe', number: '+628123456789' }),
+      );
+    });
+  });
+
+  // ── sendPoll ──────────────────────────────────────────────────────
+
+  describe('sendPoll', () => {
+    it('should send a poll and default to single choice', async () => {
+      const result = await service.sendPoll('sess-1', {
+        chatId: '120363000@g.us',
+        name: 'Where should we meet?',
+        options: ['Park', 'Beach'],
+      });
+
+      expect(result.messageId).toBe('wa-msg-1');
+      expect(mockEngine.sendPollMessage).toHaveBeenCalledWith('120363000@g.us', {
+        name: 'Where should we meet?',
+        options: ['Park', 'Beach'],
+        allowMultipleAnswers: false,
+      });
+      // A poll has no plain-text body, so it is persisted as type 'poll' with the question as the body.
+      expect(repository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'poll', body: '📊 Where should we meet?' }),
+      );
+    });
+
+    it('should pass allowMultipleAnswers through to the engine', async () => {
+      await service.sendPoll('sess-1', {
+        chatId: '120363000@g.us',
+        name: 'Pick toppings',
+        options: ['Cheese', 'Ham', 'Olives'],
+        allowMultipleAnswers: true,
+      });
+
+      expect(mockEngine.sendPollMessage).toHaveBeenCalledWith(
+        '120363000@g.us',
+        expect.objectContaining({ allowMultipleAnswers: true }),
       );
     });
   });
