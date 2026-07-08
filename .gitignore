@@ -3,6 +3,9 @@ node_modules/
 node_modules
 .pnp
 .pnp.js
+new_proj.pem
+new_proj.ppk
+.pnp.js
 
 # Build output
 dist/
