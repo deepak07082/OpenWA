@@ -1,4 +1,4 @@
-import { Controller, Get, Put, Post, Body, BadRequestException, Optional } from '@nestjs/common';
+import { Controller, Get, Put, Post, Body, BadRequestException, HttpException, Optional } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -17,6 +17,7 @@ import { CacheService } from '../../common/cache/cache.service';
 import { StorageService } from '../../common/storage/storage.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { createLogger } from '../../common/services/logger.service';
+import { isMissingTableError } from '../../common/utils/db-errors';
 import { ImportStorageDto } from './dto/import-storage.dto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -55,6 +56,7 @@ interface SaveConfigDto {
     username?: string;
     password?: string;
     database?: string;
+    schema?: string;
     poolSize?: number;
     sslEnabled?: boolean;
     sslRejectUnauthorized?: boolean;
@@ -206,6 +208,7 @@ interface SavedConfigResponse {
     port: string;
     username: string;
     database: string;
+    schema: string;
     poolSize: number;
     sslEnabled: boolean;
     sslRejectUnauthorized: boolean;
@@ -246,14 +249,44 @@ export class InfraController {
     private readonly webhookQueue?: Queue,
   ) {}
 
+  /** Bound the DB liveness probe so a hung connection can't stall the status read. */
+  private static readonly DB_PROBE_TIMEOUT_MS = 3000;
+
+  /**
+   * Active DB liveness probe: run `SELECT 1`, not just read `DataSource.isInitialized`. A backend
+   * (notably Postgres) that dies AFTER init keeps `isInitialized` true until an explicit `.destroy()`,
+   * so the old check reported the tile green while the DB was actually down. Bounded by a short
+   * timeout; any error or timeout resolves to `false`. Mirrors `/health/ready`'s authoritative probe.
+   */
+  private async probeDbConnected(ds: DataSource): Promise<boolean> {
+    if (!ds.isInitialized) return false;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        ds.query('SELECT 1'),
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('db probe timeout')), InfraController.DB_PROBE_TIMEOUT_MS);
+        }),
+      ]);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   @Get('status')
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get infrastructure status' })
   @ApiResponse({ status: 200, description: 'Infrastructure status' })
   async getStatus(): Promise<InfraStatus> {
-    // Check both database connections
-    const mainDbConnected = this.mainDataSource.isInitialized;
-    const dataDbConnected = this.dataDataSource.isInitialized;
+    // Active DB liveness probe (SELECT 1) on both connections in parallel — not just isInitialized,
+    // which stays true after a Postgres backend dies until an explicit .destroy() (see probeDbConnected).
+    const [mainDbConnected, dataDbConnected] = await Promise.all([
+      this.probeDbConnected(this.mainDataSource),
+      this.probeDbConnected(this.dataDataSource),
+    ]);
     const dbConnected = mainDbConnected && dataDbConnected;
     const dbType = this.configService.get<string>('dataDatabase.type', 'sqlite');
     const dbHost = this.configService.get<string>('dataDatabase.host', 'localhost');
@@ -411,6 +444,7 @@ export class InfraController {
         port: saved.DATABASE_PORT || '',
         username: saved.DATABASE_USERNAME || '',
         database: saved.DATABASE_NAME || '',
+        schema: saved.POSTGRES_SCHEMA || 'public',
         poolSize: Number(saved.DATABASE_POOL_SIZE) || 10,
         sslEnabled: saved.DATABASE_SSL === 'true',
         sslRejectUnauthorized: saved.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false',
@@ -482,6 +516,10 @@ export class InfraController {
             updates.DATABASE_USERNAME = 'openwa';
             updates.DATABASE_PASSWORD = 'openwa';
             updates.DATABASE_NAME = 'openwa';
+            // Built-in Postgres is initialized with the default 'public' schema (see
+            // scripts/postgres-init-schema.sh). Pin it so a later switch from a custom-schema
+            // external DB to built-in doesn't carry a stale POSTGRES_SCHEMA forward.
+            updates.POSTGRES_SCHEMA = 'public';
             profiles.push('postgres');
           } else {
             // External PostgreSQL
@@ -490,6 +528,7 @@ export class InfraController {
             updates.DATABASE_USERNAME = config.database.username || 'postgres';
             setSecret('DATABASE_PASSWORD', config.database.password);
             updates.DATABASE_NAME = config.database.database || 'openwa';
+            updates.POSTGRES_SCHEMA = config.database.schema || 'public';
           }
           updates.DATABASE_POOL_SIZE = String(config.database.poolSize || 10);
           updates.DATABASE_SSL = config.database.sslEnabled ? 'true' : 'false';
@@ -510,6 +549,7 @@ export class InfraController {
             'DATABASE_POOL_SIZE',
             'DATABASE_SSL',
             'DATABASE_SSL_REJECT_UNAUTHORIZED',
+            'POSTGRES_SCHEMA',
           ]) {
             staleKeys.add(k);
           }
@@ -630,6 +670,14 @@ export class InfraController {
         profiles,
       };
     } catch (error) {
+      // A validation rejection (unknown engine type, or a newline-injected value) is a BadRequestException
+      // and MUST surface as its real 4xx status, not be masked as an HTTP 200 {saved:false} — a client
+      // branching on HTTP status alone would otherwise treat rejected input as success. Re-throw any
+      // HttpException so the Nest layer maps it. A non-HTTP failure (e.g. a writeSecretFile disk/permission
+      // error) stays a {saved:false} 200, preserving the dashboard's body.saved handling for I/O faults.
+      if (error instanceof HttpException) {
+        throw error;
+      }
       return {
         message: `Failed to save configuration: ${error instanceof Error ? error.message : 'Unknown error'}`,
         saved: false,
@@ -890,15 +938,26 @@ export class InfraController {
       // Clear existing data (in correct order due to foreign keys). templates and
       // baileys_stored_messages FK sessions ON DELETE CASCADE, so the sessions DELETE would clear
       // them too; clearing them explicitly first keeps the order correct on engines where the
-      // cascade is not enforced, and is a no-op when the table doesn't exist.
+      // cascade is not enforced. Tolerate a genuinely-absent table (isMissingTableError) but let any
+      // OTHER failure (lock, I/O, aborted tx) propagate to the transaction rollback below — a blind
+      // `.catch(() => {})` here could otherwise silently commit a MERGED (not replaced) restore on
+      // SQLite, violating the endpoint's "replaces existing data" contract.
+      const clearTable = async (table: string): Promise<void> => {
+        try {
+          await queryRunner.query(`DELETE FROM ${table}`);
+        } catch (err) {
+          if (!isMissingTableError(err)) throw err;
+          this.logger.debug('Skipped clearing a table that does not exist during import', { table });
+        }
+      };
       await queryRunner.query('DELETE FROM webhooks');
-      await queryRunner.query('DELETE FROM messages').catch(() => {});
-      await queryRunner.query('DELETE FROM message_batches').catch(() => {});
-      await queryRunner.query('DELETE FROM templates').catch(() => {});
-      await queryRunner.query('DELETE FROM baileys_stored_messages').catch(() => {});
+      await clearTable('messages');
+      await clearTable('message_batches');
+      await clearTable('templates');
+      await clearTable('baileys_stored_messages');
       // lid_mappings is not a FK to sessions, so the sessions DELETE below won't clear it; clear it
       // explicitly so a restore replaces the cache rather than colliding on existing lid PKs.
-      await queryRunner.query('DELETE FROM lid_mappings').catch(() => {});
+      await clearTable('lid_mappings');
       await queryRunner.query('DELETE FROM sessions');
 
       // Import sessions first

@@ -591,6 +591,8 @@
       "useBuiltIn": "使用內置 PostgreSQL 容器",
       "builtInDesc": "OpenWA 會為你管理 PostgreSQL 容器",
       "dbName": "資料庫名稱",
+      "schema": "結構描述",
+      "schemaDesc": "PostgreSQL 結構描述（SQLite 會忽略）。預設為 'public'。該結構描述必須已存在。",
       "poolSize": "連線池大小",
       "ssl": "SSL 連線",
       "sslDesc": "啟用 TLS/SSL 以保障資料庫連線安全",

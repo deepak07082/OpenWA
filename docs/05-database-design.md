@@ -81,6 +81,40 @@ if (process.env.POSTGRES_BUILTIN === 'true') {
 const app = await NestFactory.create(AppModule); // Then bootstrap
 ```
 
+#### PostgreSQL Schema Selection
+
+When using PostgreSQL, OpenWA can place its tables and migration ledger in a dedicated schema via the `POSTGRES_SCHEMA` environment variable:
+
+| Setting            | Default | Description                                                                 |
+| ------------------ | ------- | --------------------------------------------------------------------------- |
+| `POSTGRES_SCHEMA`  | `public` | PostgreSQL schema for OpenWA tables and TypeORM migration ledger          |
+
+**Use Cases:**
+- **Managed PostgreSQL:** Use your cloud provider's project schema (e.g., a schema provisioned by the provider)
+- **Multi-tenant databases:** Isolate OpenWA from other applications sharing the same database
+- **Clean separation:** Keep OpenWA's tables organized separately from other schemas
+
+**Configuration:**
+```bash
+# .env or dashboard Infrastructure page
+POSTGRES_SCHEMA=openwa  # Use a dedicated schema
+POSTGRES_SCHEMA=public   # Default behavior (historical)
+```
+
+**Requirements:**
+- The schema must already exist before migration time
+- Built-in PostgreSQL container automatically creates the schema via init script
+- External/managed PostgreSQL: run `CREATE SCHEMA <name>;` once before first startup
+- SQLite ignores this setting
+
+**Validation:**
+- Schema name is validated at boot as a legal Postgres identifier (letters, digits, underscores, max 63 chars)
+- Reserved `pg_` prefix is rejected to prevent conflicts with system schemas
+- Invalid values cause fast boot failure rather than migration-time errors
+
+> [!NOTE]
+> TypeORM's `schema` option alone does not set the session `search_path`. OpenWA additionally sets `search_path=<schema>,public` via PostgreSQL's startup `options` parameter so raw, unqualified migration DDL resolves to the configured schema. The migration ledger and all tables land in the specified schema while keeping `public` accessible for `pg_catalog` and helpers.
+
 #### Data Migration API
 
 OpenWA provides endpoints for migrating data between database types:

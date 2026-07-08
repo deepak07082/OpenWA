@@ -1,5 +1,11 @@
+import { computeFeatureFlags } from './feature-flags';
+
 export default () => ({
   port: parseInt(process.env.PORT || '2785', 10),
+
+  // Runtime feature flags. Single source of truth: src/config/feature-flags.ts. Exposed here so the
+  // full set is discoverable via ConfigService (`features.*`) instead of scattered process.env reads.
+  features: computeFeatureFlags(),
 
   // Redis configuration
   redis: {
@@ -44,6 +50,12 @@ export default () => ({
     // DATABASE_NAME env as the migration CLI (data-source.ts) so the runtime factory and
     // migrations never target different databases. Distinct sqlite-vs-pg defaults.
     name: process.env.DATABASE_NAME || 'openwa',
+    // PostgreSQL schema (used when type is postgres). Default 'public' preserves the historical
+    // behavior; set POSTGRES_SCHEMA to place OpenWA's tables + the TypeORM migration ledger in a
+    // dedicated schema (e.g. a managed-Postgres project schema, or to isolate OpenWA from other
+    // apps sharing the database). The schema must already exist — a missing one fails fast at
+    // migration time rather than silently falling back to public. SQLite ignores this.
+    schema: process.env.POSTGRES_SCHEMA || 'public',
     // PostgreSQL/MySQL connection (used when type is postgres/mysql)
     host: process.env.DATABASE_HOST || 'localhost',
     port: parseInt(process.env.DATABASE_PORT || '5432', 10),

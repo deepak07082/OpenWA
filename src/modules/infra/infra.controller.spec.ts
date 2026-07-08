@@ -26,7 +26,7 @@ jest.mock('fs', () => {
   };
 });
 
-import { DataSource } from 'typeorm';
+import { DataSource, QueryFailedError } from 'typeorm';
 import { InfraController } from './infra.controller';
 import { REQUIRED_ROLE_KEY } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
@@ -91,12 +91,42 @@ describe('InfraController.importStorage filePath validation (Vuln 3)', () => {
   });
 });
 
-describe('InfraController.getStatus queue job counts (F-18)', () => {
+describe('InfraController.getStatus DB health (active SELECT 1 probe, not just isInitialized)', () => {
+  const build = (query: jest.Mock) => {
+    // engine.type=baileys skips the wa-web-version registry fetch (no network in unit tests).
+    const config = { get: (k: string, def?: unknown) => (k === 'engine.type' ? 'baileys' : def) };
+    const ds = { isInitialized: true, query };
+    const cache = { isAvailable: jest.fn().mockResolvedValue(false), refreshS3Availability: jest.fn() };
+    return new InfraController(
+      config as never,
+      ds as never,
+      ds as never,
+      { create: jest.fn() } as never,
+      { isDockerAvailable: () => false, getRunningBuiltinServices: jest.fn() } as never,
+      cache as never,
+      { refreshS3Availability: jest.fn() } as never,
+      {} as never,
+      undefined as never,
+    );
+  };
+
+  it('reports connected:true when SELECT 1 succeeds', async () => {
+    const status = await build(jest.fn().mockResolvedValue([{ '1': 1 }])).getStatus();
+    expect(status.database.connected).toBe(true);
+  });
+
+  it('reports connected:false when the DB is initialized but SELECT 1 fails (backend died post-init)', async () => {
+    const status = await build(jest.fn().mockRejectedValue(new Error('ECONNRESET'))).getStatus();
+    expect(status.database.connected).toBe(false);
+  });
+});
+
+describe('InfraController.getStatus queue job counts', () => {
   function buildStatusController(opts: { queueEnabled: boolean; queue?: { getJobCounts: jest.Mock } }) {
     const configService = {
       get: (key: string, def?: unknown) => (key === 'queue.enabled' ? opts.queueEnabled : def),
     };
-    const dataSource = { isInitialized: true } as unknown;
+    const dataSource = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) } as unknown;
     const engineFactory = { create: jest.fn() };
     const dockerService = { isDockerAvailable: () => false, getRunningBuiltinServices: jest.fn() };
     const cacheService = { isAvailable: jest.fn().mockResolvedValue(false), refreshS3Availability: jest.fn() };
@@ -169,6 +199,61 @@ describe('InfraController.saveConfig SSL reject-unauthorized', () => {
   it('omits DATABASE_SSL_REJECT_UNAUTHORIZED when SSL is disabled', () => {
     const env = writtenEnv({ database: { type: 'postgres', sslEnabled: false } });
     expect(env).not.toContain('DATABASE_SSL_REJECT_UNAUTHORIZED');
+  });
+});
+
+describe('InfraController PostgreSQL schema (POSTGRES_SCHEMA)', () => {
+  const newController = () =>
+    new InfraController(
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+  function written(config: unknown, existing?: string): string {
+    (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
+    (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
+    (fs.writeFileSync as jest.Mock).mockClear();
+    newController().saveConfig(config as never);
+    const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+    return content;
+  }
+
+  it('writes POSTGRES_SCHEMA for external Postgres', () => {
+    const env = written({ database: { type: 'postgres', builtIn: false, host: 'db', schema: 'openwa' } });
+    expect(env).toContain('POSTGRES_SCHEMA=openwa');
+  });
+
+  it('defaults POSTGRES_SCHEMA to public for external Postgres when no schema is provided', () => {
+    const env = written({ database: { type: 'postgres', builtIn: false, host: 'db' } });
+    expect(env).toContain('POSTGRES_SCHEMA=public');
+  });
+
+  it('pins POSTGRES_SCHEMA=public for the built-in Postgres container', () => {
+    const env = written({ database: { type: 'postgres', builtIn: true } });
+    expect(env).toContain('POSTGRES_SCHEMA=public');
+  });
+
+  it('does not write POSTGRES_SCHEMA for sqlite', () => {
+    const env = written({ database: { type: 'sqlite' } });
+    expect(env).not.toContain('POSTGRES_SCHEMA=');
+  });
+
+  it('getConfig surfaces the saved POSTGRES_SCHEMA, defaulting to public', () => {
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue('DATABASE_TYPE=postgres\nPOSTGRES_SCHEMA=openwa\n');
+    expect(newController().getConfig().database.schema).toBe('openwa');
+    (fs.readFileSync as jest.Mock).mockReturnValue('DATABASE_TYPE=postgres\n');
+    expect(newController().getConfig().database.schema).toBe('public');
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
   });
 });
 
@@ -258,13 +343,15 @@ describe('InfraController.saveConfig env-name correctness and merge (#226)', () 
     expect(env).toContain('DATABASE_HOST=db');
   });
 
-  it('drops stale postgres keys when switching to sqlite', () => {
-    const existing = 'DATABASE_TYPE=postgres\nDATABASE_HOST=oldhost\nDATABASE_PASSWORD=secret\nDATABASE_PORT=5432\n';
+  it('drops stale postgres keys (including POSTGRES_SCHEMA) when switching to sqlite', () => {
+    const existing =
+      'DATABASE_TYPE=postgres\nDATABASE_HOST=oldhost\nDATABASE_PASSWORD=secret\nDATABASE_PORT=5432\nPOSTGRES_SCHEMA=openwa\n';
     const env = written({ database: { type: 'sqlite' } }, existing);
     expect(env).toContain('DATABASE_TYPE=sqlite');
     expect(env).not.toContain('DATABASE_HOST=');
     expect(env).not.toContain('DATABASE_PASSWORD=');
     expect(env).not.toContain('DATABASE_PORT=');
+    expect(env).not.toContain('POSTGRES_SCHEMA=');
   });
 
   it('drops stale S3 keys when switching storage to local', () => {
@@ -302,9 +389,9 @@ describe('InfraController.saveConfig rejects values that would inject extra env 
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.writeFileSync as jest.Mock).mockClear();
 
-    const result = newController().saveConfig({ engine: { browserArgs: malicious } });
-
-    expect(result.saved).toBe(false);
+    // A newline-injected value is rejected outright with a 4xx (BadRequestException), not masked as a
+    // {saved:false} 200 — and nothing is written.
+    expect(() => newController().saveConfig({ engine: { browserArgs: malicious } })).toThrow(BadRequestException);
     expect(fs.writeFileSync as jest.Mock).not.toHaveBeenCalled();
   });
 
@@ -359,9 +446,8 @@ describe('InfraController.saveConfig engine selection (persist ENGINE_TYPE — I
 
   it('rejects an unknown engine type and writes nothing', () => {
     (fs.writeFileSync as jest.Mock).mockClear();
-    const res = newController().saveConfig({ engine: { type: 'bogus' } });
-    expect(res.saved).toBe(false);
-    expect(res.message).toMatch(/unknown engine/i);
+    // Rejected as a 4xx (BadRequestException naming the bad engine), not a {saved:false} 200.
+    expect(() => newController().saveConfig({ engine: { type: 'bogus' } })).toThrow(/unknown engine/i);
     expect(fs.writeFileSync as jest.Mock).not.toHaveBeenCalled();
   });
 });
@@ -527,6 +613,66 @@ describe('InfraController.importData round-trips export-data (no silent message/
     expect(await ds.getRepository(Session).count()).toBe(1);
     expect(await ds.getRepository(Message).count()).toBe(1);
   });
+
+  it('propagates a genuine clear-table failure (lock/IO) instead of committing a merged restore', async () => {
+    // Pre-existing data that must survive if a clear step fails.
+    await seedSession('s1');
+    await ds.getRepository(Message).save(
+      ds.getRepository(Message).create({
+        id: 'm1',
+        sessionId: 's1',
+        chatId: 'c1',
+        from: 'a',
+        to: 'b',
+        body: 'keep me',
+        type: 'text',
+        direction: MessageDirection.INCOMING,
+        status: MessageStatus.DELIVERED,
+      }),
+    );
+
+    expect(await ds.getRepository(Message).count()).toBe(1); // sanity: seeded
+
+    // Make ONLY `DELETE FROM messages` fail with a genuine (non-missing-table) error. Previously a
+    // blind `.catch(() => {})` swallowed this and let a disjoint-id backup COMMIT a merged (not
+    // replaced) restore on SQLite; scoping the swallow to missing-table means the failure must now
+    // SURFACE (reaching the existing rollback-and-rethrow catch). A Proxy over the runner the
+    // controller creates intercepts just that one statement — no spy on `query`, so TypeORM's own
+    // internal `this.query` transaction control (BEGIN/ROLLBACK) is untouched.
+    const lockErr = new QueryFailedError(
+      'DELETE FROM messages',
+      [],
+      Object.assign(new Error('SQLITE_BUSY: database is locked'), { code: 'SQLITE_BUSY' }),
+    );
+    let rolledBack = false;
+    const origCreate = ds.createQueryRunner.bind(ds);
+    jest.spyOn(ds, 'createQueryRunner').mockImplementation(() => {
+      const real = origCreate();
+      return new Proxy(real, {
+        get(target, prop) {
+          if (prop === 'query') {
+            return (sql: string, params?: unknown[]) =>
+              sql === 'DELETE FROM messages'
+                ? Promise.reject(lockErr)
+                : (target.query as (q: string, p?: unknown[]) => Promise<unknown>).call(target, sql, params);
+          }
+          if (prop === 'rollbackTransaction') {
+            return async () => {
+              rolledBack = true;
+              return target.rollbackTransaction.call(target);
+            };
+          }
+          const val = (target as unknown as Record<string, unknown>)[prop as string];
+          return typeof val === 'function' ? (val as (...a: unknown[]) => unknown).bind(target) : val;
+        },
+      });
+    });
+
+    await expect(controller.importData({ tables: { messages: [] } })).rejects.toThrow(/database is locked/);
+    expect(rolledBack).toBe(true);
+
+    jest.restoreAllMocks();
+  });
 });
 
 describe('InfraController.import/export preserves every data-DB table', () => {
@@ -682,7 +828,7 @@ describe('InfraController.getConfig (#226)', () => {
   });
 });
 
-describe('InfraController.getStatus engine (F7 — reads the real engine.puppeteer.* keys)', () => {
+describe('InfraController.getStatus engine (reads the real engine.puppeteer.* keys)', () => {
   // Pin the WA-Web version so getStatus does not fire the wa-version registry fetch (no network in tests).
   const savedWebVer = process.env.WWEBJS_WEB_VERSION;
   beforeAll(() => (process.env.WWEBJS_WEB_VERSION = 'off'));
@@ -700,7 +846,7 @@ describe('InfraController.getStatus engine (F7 — reads the real engine.puppete
     };
     const config = { get: (key: string, def?: unknown) => (key in map ? map[key] : def) };
     const cache = { isAvailable: () => Promise.resolve(false) };
-    const ds = { isInitialized: true };
+    const ds = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) };
     const controller = new InfraController(
       config as never,
       ds as never,
@@ -731,7 +877,7 @@ describe('InfraController.getStatus storage (reads the real storage.localPath ke
   const buildController = (map: Record<string, unknown>) => {
     const config = { get: (key: string, def?: unknown) => (key in map ? map[key] : def) };
     const cache = { isAvailable: () => Promise.resolve(false) };
-    const ds = { isInitialized: true };
+    const ds = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) };
     return new InfraController(
       config as never,
       ds as never,

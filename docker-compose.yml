@@ -4,7 +4,7 @@
 services:
   # ===== CORE: Docker Socket Proxy (sole container with /var/run/docker.sock access) =====
   docker-proxy:
-    image: tecnativa/docker-socket-proxy
+    image: tecnativa/docker-socket-proxy:v0.4.2
     container_name: openwa-docker-proxy
     restart: unless-stopped
     # Only on the isolated internal network — reachable solely by openwa-api, NOT the
@@ -34,6 +34,11 @@ services:
       dockerfile: Dockerfile
     container_name: openwa-api
     restart: unless-stopped
+    # Give the graceful drain room to complete before Docker SIGKILLs the container: the shutdown
+    # grace (SHUTDOWN_DELAY_MS, default 3s) plus the worst-case per-engine teardown bound (~10s) can
+    # exceed Docker's 10s default, which would otherwise kill Chromium mid-teardown and orphan a
+    # session profile. Tune down if you raise neither SHUTDOWN_DELAY_MS nor run many sessions.
+    stop_grace_period: 45s
     # App network for datastores + the isolated network to reach
     # docker-proxy (DOCKER_HOST). createService() in docker.service.ts attaches
     # orchestrated containers to the literal `openwa-network`, so its name is fixed.
@@ -60,7 +65,17 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-    pids_limit: 512
+    # Per-container PID ceiling (writes the cgroup pids.max). A fork-bomb guard, NOT an allocation —
+    # the kernel only rejects new forks once the count is reached, so a higher limit is free for
+    # light containers. The old default (512, from the #243 hardening pass) was picked without
+    # accounting for Chromium's multi-process model: whatsapp-web.js runs a full Chromium instance
+    # per session (browser + renderer + GPU + zygote + utilities), and WhatsApp Web is process-heavy
+    # (service workers/iframes), so ~4 concurrent sessions already approach 512 and a new session's
+    # Chromium gets killed mid-spawn — surfacing in the API as `Code: null`. 2048 fits ~8-10 wwjs
+    # sessions with startup-spike headroom; Baileys is single-process (no Chromium) and uses far
+    # less, so the higher ceiling is a no-op there. Raise via OPENWA_PIDS_LIMIT for larger fleets;
+    # do NOT set -1 (unlimited) — that drops the fork-bomb guard. See #636.
+    pids_limit: ${OPENWA_PIDS_LIMIT:-2048}
     mem_limit: ${OPENWA_MEM_LIMIT:-2g} # tune up for many concurrent sessions
     ports:
       - '127.0.0.1:${API_PORT:-2785}:2785'
@@ -94,6 +109,9 @@ services:
       # No committed default secret; blank unless the operator sets it (built-in Postgres is provisioned
       # with its own credentials by the orchestrator, not via this line).
       - DATABASE_PASSWORD=${DATABASE_PASSWORD:-}
+      # PostgreSQL schema (blank-forwarded like the other DATABASE_* keys so a dashboard-saved
+      # POSTGRES_SCHEMA in data/.env.generated applies; a real host value pins). Ignored for sqlite.
+      - POSTGRES_SCHEMA=${POSTGRES_SCHEMA:-}
       - DATABASE_SYNCHRONIZE=${DATABASE_SYNCHRONIZE:-false}
       # Engine. Forwarded empty by default so the dashboard (Infrastructure > Engine) selects the
       # active engine via data/.env.generated (defaults to whatsapp-web.js); main.ts treats a blank
@@ -194,8 +212,16 @@ services:
       # production boot guard rejects empty/placeholder secrets before startup.
       POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-}
       POSTGRES_DB: ${DATABASE_NAME:-openwa}
+      # PostgreSQL schema for OpenWA's tables + migration ledger. Default 'public'. The init
+      # script below creates the schema (if non-public) and sets the database default search_path,
+      # so the built-in container works zero-config with a custom schema. Ignored when 'public'.
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Runs only on first init (postgres image docker-entrypoint-initdb.d semantics): creates the
+      # configured schema and sets the DB default search_path. No-op for 'public'; does not re-run
+      # on an already-initialized volume (see the note in scripts/postgres-init-schema.sh).
+      - ./scripts/postgres-init-schema.sh:/docker-entrypoint-initdb.d/01-create-schema.sh:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U ${DATABASE_USERNAME:-openwa}']
       interval: 5s
@@ -229,7 +255,7 @@ services:
 
   # ===== OPTIONAL: Built-in MinIO (S3-compatible) =====
   minio:
-    image: minio/minio
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: openwa-minio
     profiles: ['minio', 'full']
     restart: unless-stopped

@@ -1,6 +1,7 @@
 import {
   resolveCorsPolicy,
   isSwaggerEnabled,
+  isValidationErrorDetailEnabled,
   isUpgradeInsecureRequestsEnabled,
   resolveBodyLimit,
   assertNoDefaultSecretsInProduction,
@@ -82,6 +83,18 @@ describe('isSwaggerEnabled', () => {
   });
 });
 
+describe('isValidationErrorDetailEnabled', () => {
+  it('shows detail outside production but hides it in production by default (unchanged default)', () => {
+    expect(isValidationErrorDetailEnabled(undefined, 'development')).toBe(true);
+    expect(isValidationErrorDetailEnabled(undefined, 'production')).toBe(false);
+    expect(isValidationErrorDetailEnabled('', 'production')).toBe(false);
+  });
+  it('honors an explicit opt-in/out regardless of env', () => {
+    expect(isValidationErrorDetailEnabled('true', 'production')).toBe(true); // debug an SDK against prod
+    expect(isValidationErrorDetailEnabled('false', 'development')).toBe(false);
+  });
+});
+
 describe('resolveBodyLimit', () => {
   it('defaults to a media-aware 25mb', () => {
     expect(resolveBodyLimit(undefined)).toBe('25mb');
@@ -89,6 +102,16 @@ describe('resolveBodyLimit', () => {
   });
   it('honors an explicit limit', () => {
     expect(resolveBodyLimit('5mb')).toBe('5mb');
+  });
+  it('falls back to the default for a value the body-size parser cannot understand (which would silently disable the cap)', () => {
+    expect(resolveBodyLimit('unlimited')).toBe('25mb');
+    expect(resolveBodyLimit('none')).toBe('25mb');
+    expect(resolveBodyLimit('abc')).toBe('25mb');
+  });
+  it('still honors valid numeric/unit limits, preserving case and unit', () => {
+    expect(resolveBodyLimit('10MB')).toBe('10MB');
+    expect(resolveBodyLimit('1024')).toBe('1024');
+    expect(resolveBodyLimit('1.5gb')).toBe('1.5gb');
   });
 });
 

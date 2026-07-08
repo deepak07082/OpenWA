@@ -67,7 +67,7 @@ export function Login({ onLogin }: LoginProps) {
 
         {/* <div className="login-language">
           <Languages size={18} />
-          <select
+          <CustomSelect
             value={currentLang}
             onChange={event => changeLanguage(event.target.value as SupportedLanguage)}
             aria-label={t('common.language')}

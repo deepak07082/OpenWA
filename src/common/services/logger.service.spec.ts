@@ -157,7 +157,8 @@ describe('LoggerService', () => {
 
       const output = getRawOutput(errorSpy);
       expect(output).toContain('Error message');
-      expect(output).toContain('\nstack trace line');
+      expect(output).toContain('stack trace line');
+      expect(output).toMatch(/\n.*stack trace line/);
     });
   });
 

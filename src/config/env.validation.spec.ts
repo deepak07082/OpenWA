@@ -18,10 +18,35 @@ describe('validateEnv', () => {
     ).not.toThrow();
   });
 
+  it('validates POSTGRES_SCHEMA as a legal, non-reserved Postgres identifier when set', () => {
+    const pg = { DATABASE_TYPE: 'postgres', DATABASE_HOST: 'db', DATABASE_USERNAME: 'u', DATABASE_PASSWORD: 'p' };
+    // unset / 'public' (default) and ordinary identifiers are fine
+    expect(() => validateEnv({ ...pg })).not.toThrow();
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'public' })).not.toThrow();
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'openwa' })).not.toThrow();
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'my_app_2' })).not.toThrow();
+    // invalid identifier characters (would reach CREATE TABLE "<schema>"."..." or a search_path SET)
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'openwa; DROP' })).toThrow(/POSTGRES_SCHEMA/);
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: '1bad' })).toThrow(/POSTGRES_SCHEMA/);
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'has space' })).toThrow(/POSTGRES_SCHEMA/);
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'a.b' })).toThrow(/POSTGRES_SCHEMA/);
+    // reserved pg_ prefix rejected (case-insensitive)
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'pg_catalog' })).toThrow(/POSTGRES_SCHEMA/);
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'Pg_temp' })).toThrow(/POSTGRES_SCHEMA/);
+    // ignored for sqlite: a bogus value must NOT trip when not on postgres
+    expect(() => validateEnv({ DATABASE_TYPE: 'sqlite', POSTGRES_SCHEMA: '1bad' })).not.toThrow();
+  });
+
   it('rejects a non-integer / out-of-range port', () => {
     expect(() => validateEnv({ DATABASE_PORT: 'abc' })).toThrow(/DATABASE_PORT/);
     expect(() => validateEnv({ PORT: '70000' })).toThrow(/PORT/);
     expect(() => validateEnv({ PORT: '2785' })).not.toThrow();
+  });
+
+  it('rejects a non-numeric database timeout knob (a typo would become NaN and break the pg pool)', () => {
+    expect(() => validateEnv({ DATABASE_STATEMENT_TIMEOUT_MS: 'abc' })).toThrow(/DATABASE_STATEMENT_TIMEOUT_MS/);
+    expect(() => validateEnv({ DATABASE_IDLE_TIMEOUT_MS: '30s' })).toThrow(/DATABASE_IDLE_TIMEOUT_MS/);
+    expect(() => validateEnv({ DATABASE_CONNECTION_TIMEOUT_MS: '10000' })).not.toThrow();
   });
 
   it('rejects an ENGINE_TYPE typo instead of silently falling back to whatsapp-web.js', () => {
@@ -67,6 +92,24 @@ describe('validateEnv', () => {
     ).not.toThrow();
     // a positive value still passes
     expect(() => validateEnv({ RATE_LIMIT_SHORT_LIMIT: '10', WEBHOOK_TIMEOUT: '10000' })).not.toThrow();
+  });
+
+  it('rejects a non-canonical boolean feature flag instead of silently disabling the feature', () => {
+    // QUEUE_ENABLED / MCP_ENABLED / SERVE_DASHBOARD are read at module-eval with `=== 'true'` /
+    // `!== 'false'`, so a typo silently (dis)ables the feature with zero diagnostics. Boot must reject it.
+    expect(() => validateEnv({ QUEUE_ENABLED: 'True' })).toThrow(/QUEUE_ENABLED/);
+    expect(() => validateEnv({ QUEUE_ENABLED: '1' })).toThrow(/QUEUE_ENABLED/);
+    expect(() => validateEnv({ MCP_ENABLED: 'yes' })).toThrow(/MCP_ENABLED/);
+    expect(() => validateEnv({ SERVE_DASHBOARD: 'no' })).toThrow(/SERVE_DASHBOARD/);
+    // The raw value is checked, NOT a trimmed one: a trailing space / CR (Windows-edited env file
+    // forwarded verbatim by `docker run --env-file`) must still be rejected — otherwise the flag reads
+    // false at every `=== 'true'` site while validation passes, giving false assurance.
+    expect(() => validateEnv({ QUEUE_ENABLED: 'true ' })).toThrow(/QUEUE_ENABLED/);
+    expect(() => validateEnv({ MCP_ENABLED: 'true\r' })).toThrow(/MCP_ENABLED/);
+    // Canonical values, unset, and blank (a compose `${KEY:-}` forward renders '') all pass.
+    expect(() => validateEnv({ QUEUE_ENABLED: 'true', MCP_ENABLED: 'false', SERVE_DASHBOARD: 'true' })).not.toThrow();
+    expect(() => validateEnv({ QUEUE_ENABLED: '', SERVE_DASHBOARD: '' })).not.toThrow();
+    expect(() => validateEnv({})).not.toThrow();
   });
 
   it('rejects a sqlite data DB path that collides with the internal main database file', () => {

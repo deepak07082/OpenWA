@@ -245,6 +245,7 @@ export interface SavedConfig {
     port: string;
     username: string;
     database: string;
+    schema: string;
     poolSize: number;
     sslEnabled: boolean;
     sslRejectUnauthorized: boolean;
@@ -273,6 +274,7 @@ export interface SaveConfigPayload {
     username?: string;
     password?: string;
     database?: string;
+    schema?: string;
     poolSize?: number;
     sslEnabled?: boolean;
     sslRejectUnauthorized?: boolean;

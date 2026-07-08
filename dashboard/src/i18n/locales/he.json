@@ -592,6 +592,8 @@
       "useBuiltIn": "שימוש בקונטיינר PostgreSQL מובנה",
       "builtInDesc": "OpenWA ינהל עבורך קונטיינר PostgreSQL",
       "dbName": "שם מסד הנתונים",
+      "schema": "סכמה",
+      "schemaDesc": "סכמת PostgreSQL (לא חלה על SQLite). ברירת מחדל 'public'. הסכמה חייבת להיות קיימת מראש.",
       "poolSize": "גודל Pool",
       "ssl": "חיבור SSL",
       "sslDesc": "הפעלת TLS/SSL לחיבור מאובטח למסד הנתונים",

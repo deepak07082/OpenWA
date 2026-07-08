@@ -591,6 +591,8 @@
       "useBuiltIn": "Usa Container PostgreSQL Integrato",
       "builtInDesc": "OpenWA gestirà un container PostgreSQL per te",
       "dbName": "Nome Database",
+      "schema": "Schema",
+      "schemaDesc": "Schema PostgreSQL (ignorato per SQLite). Predefinito 'public'. Lo schema deve esistere già.",
       "poolSize": "Dimensione del Pool",
       "ssl": "Connessione SSL",
       "sslDesc": "Abilita TLS/SSL per connessioni sicure al database",

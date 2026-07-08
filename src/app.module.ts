@@ -140,10 +140,19 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
         };
 
         if (dbType === 'postgres') {
+          // Schema selection: 'public' (default) is a no-op vs the historical behavior. A non-public
+          // schema additionally sets the session search_path via pg's startup `options` parameter so
+          // the project's RAW, unqualified migration SQL (CREATE TABLE "x"..., ALTER TABLE "y"...)
+          // resolves to the configured schema — TypeORM's `schema` option alone does NOT set
+          // search_path, so without this raw DDL would land in `public` while the migration ledger
+          // lands in the configured schema.
+          const schema = configService.get<string>('dataDatabase.schema', 'public');
+          const useCustomSearchPath = schema && schema !== 'public';
           return {
             ...baseConfig,
             name: 'data',
             type: 'postgres' as const,
+            schema,
             host: configService.get<string>('dataDatabase.host'),
             port: configService.get<number>('dataDatabase.port'),
             username: configService.get<string>('dataDatabase.username'),
@@ -170,6 +179,9 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
               statement_timeout: configService.get<number>('dataDatabase.statementTimeoutMs', 30000),
               idleTimeoutMillis: configService.get<number>('dataDatabase.idleTimeoutMs', 30000),
               connectionTimeoutMillis: configService.get<number>('dataDatabase.connectionTimeoutMs', 10000),
+              // Only set for a non-public schema (see above). `<schema>,public` keeps public on the
+              // path so pg_catalog + any public helpers still resolve; the configured schema wins.
+              ...(useCustomSearchPath ? { options: `-c search_path=${schema},public` } : {}),
             },
           };
         }

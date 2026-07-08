@@ -45,6 +45,19 @@ export function isSwaggerEnabled(enableSwaggerEnv?: string, nodeEnv?: string): b
 }
 
 /**
+ * Whether the global ValidationPipe should EXPOSE field-level validation error messages. Hidden by
+ * default in production (a 400 there returns a generic message so the DTO shape isn't reflected back)
+ * and shown outside production. `VALIDATION_ERROR_DETAIL=true` forces detail on — useful for debugging
+ * an SDK/integration against a production instance without flipping NODE_ENV — and `=false` forces it
+ * off everywhere. Mirrors isSwaggerEnabled's exact-string, production-default-off contract.
+ */
+export function isValidationErrorDetailEnabled(validationDetailEnv?: string, nodeEnv?: string): boolean {
+  if (validationDetailEnv === 'true') return true;
+  if (validationDetailEnv === 'false') return false;
+  return nodeEnv !== 'production';
+}
+
+/**
  * Whether to emit the CSP `upgrade-insecure-requests` directive (browsers auto-upgrade HTTP→HTTPS).
  * An explicit CSP_UPGRADE_INSECURE_REQUESTS wins ('true'/'false'). When unset it keeps the legacy
  * behaviour — ON in production only (the secure default for Internet-facing TLS deployments), OFF
@@ -57,10 +70,16 @@ export function isUpgradeInsecureRequestsEnabled(cspEnv?: string, nodeEnv?: stri
   return nodeEnv === 'production';
 }
 
-/** Request body-size cap (DoS hardening). Default is media-aware (base64 sends ride in the JSON body). */
+/**
+ * Request body-size cap (DoS hardening). Default is media-aware (base64 sends ride in the JSON body).
+ * A value the body-size parser can't understand (e.g. 'unlimited', 'none', a typo) resolves to a null
+ * limit downstream, which SILENTLY DISABLES the cap — so an unparseable value falls back to the default
+ * instead. Accepts a positive number with an optional bytes unit (b/kb/mb/gb/tb/pb).
+ */
+const BODY_LIMIT_PATTERN = /^\d+(\.\d+)?\s?(b|kb|mb|gb|tb|pb)?$/i;
 export function resolveBodyLimit(bodySizeEnv?: string): string {
   const trimmed = bodySizeEnv?.trim();
-  return trimmed ? trimmed : '25mb';
+  return trimmed && BODY_LIMIT_PATTERN.test(trimmed) ? trimmed : '25mb';
 }
 
 /** Known weak/default/placeholder secret values that must never reach production. */

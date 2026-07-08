@@ -590,6 +590,8 @@
       "useBuiltIn": "Usar contêiner PostgreSQL integrado",
       "builtInDesc": "OpenWA gerenciará um contêiner PostgreSQL para você",
       "dbName": "Nome do banco de dados",
+      "schema": "Esquema",
+      "schemaDesc": "Esquema do PostgreSQL (ignorado para SQLite). Padrão 'public'. O esquema já deve existir.",
       "poolSize": "Tamanho do pool",
       "ssl": "Conexão SSL",
       "sslDesc": "Habilitar TLS/SSL para conexões seguras ao banco de dados",

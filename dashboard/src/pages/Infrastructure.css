@@ -208,6 +208,12 @@
   border-color: var(--primary);
 }
 
+.infrastructure-page .form-group small{
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
 /* Toggle */
 .infrastructure-page .toggle-row{
   display: flex;

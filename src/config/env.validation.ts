@@ -45,6 +45,19 @@ export function validateEnv(config: EnvConfig): EnvConfig {
         errors.push(`${key} is required when DATABASE_TYPE=postgres`);
       }
     }
+    // POSTGRES_SCHEMA is optional (defaults to 'public' in configuration.ts). When set, validate it
+    // is a legal, non-reserved Postgres identifier so a typo / injection-ish value fails fast at boot
+    // rather than reaching CREATE TABLE "<schema>"."..." (or a search_path SET) at migration time.
+    const pgSchema = str('POSTGRES_SCHEMA');
+    if (pgSchema !== undefined) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(pgSchema)) {
+        errors.push(
+          `POSTGRES_SCHEMA must be a valid Postgres identifier (a letter or underscore, then letters/digits/underscores, max 63 chars; got ${JSON.stringify(pgSchema)})`,
+        );
+      } else if (pgSchema.toLowerCase().startsWith('pg_')) {
+        errors.push(`POSTGRES_SCHEMA must not use the reserved "pg_" prefix (got ${JSON.stringify(pgSchema)})`);
+      }
+    }
   } else {
     // SQLite (explicit or default): DATABASE_NAME is a file path for the 'data' connection. It must
     // not resolve to the 'main' DB file — two TypeORM connections on one SQLite file run separate
@@ -85,6 +98,9 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'WEBHOOK_MAX_RETRIES',
     'WEBHOOK_RETRY_DELAY',
     'DATABASE_POOL_SIZE',
+    'DATABASE_STATEMENT_TIMEOUT_MS',
+    'DATABASE_IDLE_TIMEOUT_MS',
+    'DATABASE_CONNECTION_TIMEOUT_MS',
     'REDIS_CONNECT_TIMEOUT_MS',
     'MAX_CONCURRENT_SESSIONS', // 0 = unlimited
     'INGRESS_INSTANCE_TTL',
@@ -111,6 +127,36 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'INGRESS_INSTANCE_LIMIT',
   ]) {
     checkPositiveInt(key);
+  }
+
+  // Boolean feature flags read at module-eval time (app.module.ts) with a bare `=== 'true'` /
+  // `!== 'false'` comparison: a typo (`True`, `1`, `yes`) or trailing whitespace/CR silently
+  // (dis)ables the feature. Validate the RAW value — NOT a trimmed one — so `'true '` / `'true\r'`
+  // (a Windows-edited env file forwarded verbatim by `docker run --env-file`) is rejected too rather
+  // than passing validation while every read site reads it as false. Blank (a compose `${KEY:-}`
+  // forward) stays legal: it behaves as unset at every read site.
+  const checkBool = (key: string): void => {
+    const raw = config[key];
+    if (raw === undefined) return;
+    if (typeof raw !== 'string') {
+      errors.push(`${key} must be "true" or "false"`);
+      return;
+    }
+    if (raw.trim() === '') return;
+    if (raw !== 'true' && raw !== 'false') {
+      errors.push(`${key} must be "true" or "false" (got ${JSON.stringify(raw)})`);
+    }
+  };
+  for (const key of [
+    'QUEUE_ENABLED',
+    'MCP_ENABLED',
+    'SERVE_DASHBOARD',
+    'AUTO_START_SESSIONS',
+    'STORE_EPHEMERAL_MESSAGES',
+    'RESOLVE_LID_TO_PHONE',
+    'SIMULATE_TYPING',
+  ]) {
+    checkBool(key);
   }
 
   if (errors.length > 0) {

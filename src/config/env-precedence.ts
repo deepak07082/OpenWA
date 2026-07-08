@@ -26,6 +26,8 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'DATABASE_USERNAME',
   'DATABASE_NAME',
   'DATABASE_PASSWORD',
+  // PostgreSQL schema (dashboard-managed + compose blank-forwarded, like the other DATABASE_* keys)
+  'POSTGRES_SCHEMA',
   // Storage selection + S3 details (#488)
   'STORAGE_TYPE',
   'STORAGE_LOCAL_PATH',

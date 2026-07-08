@@ -595,6 +595,8 @@
       "useBuiltIn": "استخدام حاوية PostgreSQL المدمجة",
       "builtInDesc": "سيدير OpenWA حاوية PostgreSQL نيابةً عنك",
       "dbName": "اسم قاعدة البيانات",
+      "schema": "المخطط",
+      "schemaDesc": "مخطط PostgreSQL (يُتجاهل لـ SQLite). الافتراضي 'public'. يجب أن يكون المخطط موجوداً مسبقاً.",
       "poolSize": "حجم المجموعة",
       "ssl": "اتصال SSL",
       "sslDesc": "تفعيل TLS/SSL لاتصالات آمنة بقاعدة البيانات",

@@ -39,6 +39,7 @@ interface DatabaseConfig {
   username: string;
   password: string;
   database: string;
+  schema: string;
   poolSize: number;
   sslEnabled: boolean;
   sslRejectUnauthorized: boolean;
@@ -98,6 +99,7 @@ export function Infrastructure() {
     username: 'postgres',
     password: '',
     database: 'openwa',
+    schema: 'public',
     poolSize: 10,
     sslEnabled: false,
     sslRejectUnauthorized: true,
@@ -202,6 +204,7 @@ export function Infrastructure() {
       port: savedConfig.database.port || prev.port,
       username: savedConfig.database.username || prev.username,
       database: savedConfig.database.database || prev.database,
+      schema: savedConfig.database.schema || prev.schema,
       poolSize: savedConfig.database.poolSize,
       sslEnabled: savedConfig.database.sslEnabled,
       sslRejectUnauthorized: savedConfig.database.sslRejectUnauthorized,
@@ -566,6 +569,18 @@ export function Infrastructure() {
                         value={dbConfig.poolSize}
                         onChange={e => updateDbConfig('poolSize', parseInt(e.target.value))}
                       />
+                    </div>
+                  </div>
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label>{t('infrastructure.database.schema')}</label>
+                      <input
+                        type="text"
+                        value={dbConfig.schema}
+                        onChange={e => updateDbConfig('schema', e.target.value)}
+                        placeholder="public"
+                      />
+                      <small>{t('infrastructure.database.schemaDesc')}</small>
                     </div>
                   </div>
                   <div className="toggle-row">
