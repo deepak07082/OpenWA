@@ -71,6 +71,7 @@ export class CacheService implements OnModuleDestroy {
       this.redis = new Redis({
         host,
         port,
+        username: this.configService.get<string>('REDIS_USERNAME'),
         password: this.configService.get<string>('REDIS_PASSWORD'),
         db: this.configService.get<number>('REDIS_CACHE_DB', 1),
         lazyConnect: true,

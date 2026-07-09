@@ -839,5 +839,14 @@
         "actionFailed": "הפעולה נכשלה"
       }
     }
+  },
+  "search": {
+    "placeholder": "חיפוש הודעות…",
+    "results": "{{count}} תוצאות",
+    "empty": "לא נמצאו הודעות.",
+    "error": "החיפוש נכשל. נסה שוב.",
+    "unavailable": "החיפוש אינו מוגדר.",
+    "scope": { "current": "הפעלה זו" },
+    "loading": "מחפש…"
   }
 }

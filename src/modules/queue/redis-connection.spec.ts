@@ -15,26 +15,30 @@ describe('workerConnectionOptions (webhook Worker connection)', () => {
     expect(opts.enableOfflineQueue).toBeUndefined();
   });
 
-  it('reads host/port/password/connectTimeout from env with safe defaults', () => {
+  it('reads host/port/username/password/connectTimeout from env with safe defaults', () => {
     process.env = { ...ORIGINAL_ENV };
     delete process.env.REDIS_HOST;
     delete process.env.REDIS_PORT;
+    delete process.env.REDIS_USERNAME;
     delete process.env.REDIS_PASSWORD;
     delete process.env.REDIS_CONNECT_TIMEOUT_MS;
     expect(workerConnectionOptions()).toEqual({
       host: 'localhost',
       port: 6379,
+      username: undefined,
       password: undefined,
       connectTimeout: 5000,
     });
 
     process.env.REDIS_HOST = 'redis.internal';
     process.env.REDIS_PORT = '6380';
+    process.env.REDIS_USERNAME = 'myuser';
     process.env.REDIS_PASSWORD = 'secret';
     process.env.REDIS_CONNECT_TIMEOUT_MS = '1234';
     expect(workerConnectionOptions()).toEqual({
       host: 'redis.internal',
       port: 6380,
+      username: 'myuser',
       password: 'secret',
       connectTimeout: 1234,
     });

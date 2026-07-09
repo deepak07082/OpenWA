@@ -827,8 +827,20 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             // happen exactly once. Fail-open: a non-conflict DB error still dispatches, so a real
             // message is never dropped by a transient DB failure.
             let isNewMessage = true;
+            let persisted = false;
             try {
-              await this.messageRepository.insert(dbMessage as unknown as QueryDeepPartialEntity<Message>);
+              // `insert()` (not `save()`) is load-bearing: the UNIQUE(sessionId, waMessageId) constraint
+              // makes a duplicate insert throw, which is the atomic dedup oracle for #464 re-fires.
+              // Unlike `save()`, `insert()` does NOT merge DB-generated columns (@PrimaryGeneratedColumn,
+              // @CreateDateColumn) back onto the entity instance — so merge them explicitly here, before
+              // the `message:persisted` emit. `identifiers[0]` always carries the PK on both SQLite and
+              // Postgres; `generatedMaps[0]` adds createdAt where the driver returns it (Postgres yes;
+              // SQLite historically does not — acceptable; the PK is the load-bearing field for plugins).
+              const result = await this.messageRepository.insert(
+                dbMessage as unknown as QueryDeepPartialEntity<Message>,
+              );
+              Object.assign(dbMessage, result.identifiers[0] ?? {}, result.generatedMaps?.[0] ?? {});
+              persisted = true;
             } catch (err) {
               if (isUniqueConstraintError(err)) {
                 isNewMessage = false;
@@ -838,6 +850,25 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             }
             if (!isNewMessage) {
               return; // duplicate re-fire — the original already persisted and dispatched
+            }
+
+            // Fire-and-forget: a plugin handler must never break the receive path. Both engine adapters
+            // (wwjs `message` and Baileys `upsert`) converge on this persist, so one emit covers inbound.
+            // The built-in FTS search provider is DB-synced and does NOT consume this; it exists for
+            // plugin providers (Spec 2) + general use.
+            // Gate ONLY the hook on `persisted`: on a non-unique insert error (transient SQLITE_BUSY /
+            // lock-timeout / connection drop) the row was never stored and `dbMessage.id` is undefined,
+            // so emitting `message:persisted` would hand plugins an id-less payload for a row that isn't
+            // in the DB. The webhook/WS dispatch below stays fail-open — a real inbound message must
+            // never be dropped on a transient DB failure; only the hook requires a durable row.
+            if (persisted) {
+              void this.hookManager
+                .execute(
+                  'message:persisted',
+                  { sessionId: id, message: dbMessage },
+                  { sessionId: id, source: 'SessionService' },
+                )
+                .catch(() => undefined);
             }
 
             // Dispatch to webhooks with potentially modified message

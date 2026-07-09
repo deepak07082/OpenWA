@@ -3793,6 +3793,7 @@ Merge-save infrastructure config to `data/.env.generated` (a `0600` secret file)
 | `database.sslRejectUnauthorized` | boolean | No | — | Only written when `sslEnabled` is true; default true |
 | `redis.enabled` / `.builtIn` | boolean | No | — | `builtIn`+enabled forces `redis` container + profile |
 | `redis.host` / `.port` | string | No | `port` is a string | Defaults `localhost`/`6379` |
+| `redis.username` | string | No | — | Redis ACL username |
 | `redis.password` | string | No | secret | Empty keeps existing |
 | `queue.enabled` | boolean | No | — | Writes `QUEUE_ENABLED` |
 | `storage.type` | `'local' \| 's3'` | No | — | `local` drops stale S3 keys; `s3` drops `STORAGE_LOCAL_PATH` |
@@ -4396,6 +4397,81 @@ For `tools/call` the result is an MCP `CallToolResult` (`content` array of `text
 **Errors:** in-band JSON-RPC errors `-32601` (unknown method), `-32602` (invalid params / unknown tool), `-32700` (parse error), all at HTTP 200 · `500` only if the transport throws before headers are sent · `404` when `MCP_ENABLED` is not `true`
 
 > The full catalog of MCP tools (names, tiers, schemas) is documented separately — see **doc 24, MCP Integration**. This section documents only the transport endpoint.
+
+### 6.4.12 Search
+
+Base path `/api/search`. Cross-session full-text message search over an open `SearchProvider` contract;
+the built-in database full-text provider (PostgreSQL `tsvector`/`GIN`, SQLite `FTS5`) answers by
+default with zero external dependencies. Search is on by default; set `SEARCH_ENABLED=false` to remove
+the route and module entirely (the index is DB-maintained regardless — see
+[26 - Global Search](./26-global-search.md)). Requires at least `OPERATOR` role.
+
+**Auth:** API key (≥ `OPERATOR`)  ·  **Scope:** session-scoped — a scoped key's `allowedSessions` is
+injected server-side from the key (never from the query), so a scoped key cannot broaden its reach; an
+ADMIN / null-allowlist key searches all sessions.
+
+#### GET /api/search
+
+Search messages across sessions (active search provider).
+
+**Query parameters**
+
+| Name | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `q` | string | **Yes** | — | Search term. Must be non-empty after trim; whitespace-only is rejected with `400`. Passed to the active provider's native full-text matcher. |
+| `sessionId` | string | No | — | Restrict to a single session id (intersected with the key's `allowedSessions` scope). |
+| `chatId` | string | No | — | Restrict to a single chat id. |
+| `direction` | enum (`incoming` \| `outgoing`) | No | — | Filter by message direction. |
+| `type` | string | No | — | Filter by stored message `type` (e.g. `text`, `image`, `video`). Compared against `messages.type`; not an enum validation, any string is accepted and unmatched values simply return no hits. |
+| `from` | string | No | — | Filter by sender. |
+| `dateFrom` | integer (epoch ms) | No | — | Inclusive lower bound on `timestamp`. A non-numeric value is rejected with `400`. |
+| `dateTo` | integer (epoch ms) | No | — | Inclusive upper bound on `timestamp`. A non-numeric value is rejected with `400`. |
+| `limit` | integer (≥ 1) | No | `50` | Max hits to return. Clamped to `SEARCH_LIMIT_MAX` (default `100`). A non-numeric value is rejected with `400`. |
+| `offset` | integer (≥ 0) | No | `0` | Pagination offset. A non-numeric value is rejected with `400`. |
+
+**Response** `200` — `SearchResults`
+
+```json
+{
+  "hits": [
+    {
+      "messageId": "8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a",
+      "waMessageId": "true_62812...@c.us_3A...",
+      "sessionId": "a1b2c3d4-...",
+      "chatId": "6281234567890@c.us",
+      "body": "full original message body...",
+      "snippet": "...order <mark>confirmed</mark> for tomorrow…",
+      "timestamp": 1751904000000,
+      "type": "text",
+      "direction": "incoming",
+      "from": "6281234567890@c.us",
+      "score": 0.075
+    }
+  ],
+  "total": 23,
+  "tookMs": 6,
+  "provider": "builtin-fts"
+}
+```
+
+- `snippet` is an XSS-safe text excerpt with `<mark>`/`</mark>` highlight markers around the matched
+  term (both dialects emit the same markers). Render it as text, never as HTML.
+- `total` is an exact count for pagination, computed lazily only when the returned page could be full.
+- `provider` names which backend answered (e.g. `builtin-fts`); it is the registered `SearchProvider`
+  id, so it changes when a plugin backend is selected via `SEARCH_PROVIDER`.
+- `score` is optional and provider-specific (rank ordering is stable within a provider; cross-provider
+  scores are not comparable).
+
+**Errors:** `400` empty/whitespace `q`, a non-numeric `dateFrom`/`dateTo`/`limit`/`offset`, or a malformed
+SQLite FTS5 query (unbalanced quote/paren, bare operator) — Postgres's `websearch_to_tsquery` is
+tolerant and has no equivalent · `401` missing/invalid `X-API-Key` · `403` key role below `OPERATOR` ·
+`501` no search provider configured (including a non-FTS5 SQLite build, where the provider is absent) ·
+`503` active provider unhealthy (**reserved**: the built-in provider does not return it; it is the
+contract surface for a future plugin provider whose `search()` throws `ServiceUnavailableException`).
+
+> Scoping is authoritative: a scoped API key's `allowedSessions` is applied server-side and cannot be
+> overridden via the query — there is no `sessionIds` query parameter, and `SearchService` overwrites
+> any session scope at the provider boundary.
 
 ## 6.5 Real-time API (WebSocket)
 

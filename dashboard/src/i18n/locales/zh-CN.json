@@ -838,5 +838,14 @@
         "actionFailed": "操作失败"
       }
     }
+  },
+  "search": {
+    "placeholder": "搜索消息…",
+    "results": "{{count}} 条结果",
+    "empty": "未找到消息。",
+    "error": "搜索失败。请重试。",
+    "unavailable": "搜索未配置。",
+    "scope": { "current": "当前会话" },
+    "loading": "搜索中…"
   }
 }

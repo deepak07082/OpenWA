@@ -194,6 +194,7 @@ REDIS_ENABLED=true
 REDIS_BUILTIN=false      # false = external Redis
 REDIS_HOST=your-redis-host.com
 REDIS_PORT=6379
+REDIS_USERNAME=optional
 REDIS_PASSWORD=optional
 ```
 

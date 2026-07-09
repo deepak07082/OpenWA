@@ -3,6 +3,15 @@ import { computeFeatureFlags } from './feature-flags';
 export default () => ({
   port: parseInt(process.env.PORT || '2785', 10),
 
+  // Global message search. Opt-out via SEARCH_ENABLED=false. Provider defaults to 'auto' (the
+  // built-in DB full-text provider — Postgres tsvector/GIN, SQLite FTS5); 'none' disables the
+  // /search route + module at runtime while keeping the config namespace loaded.
+  search: {
+    enabled: process.env.SEARCH_ENABLED !== 'false',
+    provider: process.env.SEARCH_PROVIDER || 'auto',
+    limitMax: Number(process.env.SEARCH_LIMIT_MAX) || 100,
+  },
+
   // Runtime feature flags. Single source of truth: src/config/feature-flags.ts. Exposed here so the
   // full set is discoverable via ConfigService (`features.*`) instead of scattered process.env reads.
   features: computeFeatureFlags(),
@@ -11,6 +20,7 @@ export default () => ({
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    username: process.env.REDIS_USERNAME,
     password: process.env.REDIS_PASSWORD,
     connectTimeoutMs: parseInt(process.env.REDIS_CONNECT_TIMEOUT_MS || '5000', 10),
   },

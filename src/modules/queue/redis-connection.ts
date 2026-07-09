@@ -9,13 +9,14 @@
  * (moveToActive, lock renewal) need to tolerate a brief reconnect during a Redis blip/failover;
  * BullMQ explicitly recommends leaving the offline queue enabled for Worker connections. Because
  * @nestjs/bullmq otherwise builds the Worker from the same shared connection, the WebhookProcessor
- * overrides its connection with these options — host/port/password/timeout identical to the producer
+ * overrides its connection with these options — host/port/username/password/timeout identical to the producer
  * (same env vars, same defaults as configuration.ts), but with the offline queue left at ioredis's
  * default of `true` so a transient outage no longer throws "Stream isn't writeable" and stalls jobs.
  */
 export interface WorkerConnectionOptions {
   host: string;
   port: number;
+  username?: string;
   password?: string;
   connectTimeout: number;
 }
@@ -24,6 +25,7 @@ export function workerConnectionOptions(): WorkerConnectionOptions {
   return {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    username: process.env.REDIS_USERNAME,
     password: process.env.REDIS_PASSWORD,
     connectTimeout: parseInt(process.env.REDIS_CONNECT_TIMEOUT_MS || '5000', 10),
   };
