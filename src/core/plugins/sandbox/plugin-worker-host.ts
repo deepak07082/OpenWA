@@ -5,6 +5,7 @@ import {
   SandboxStaticContext,
   PluginLogLevel,
 } from './protocol';
+import type { SearchQuery, SearchResults } from '../../../modules/search/search.types';
 
 /**
  * Host-side driver for a single untrusted plugin running in a worker. Owns the request/response
@@ -48,6 +49,13 @@ export class PluginWorkerHost {
     number,
     { resolve: (result: { healthy: boolean; message?: string }) => void; timer: ReturnType<typeof setTimeout> }
   >();
+  private readonly searchPending = new Map<
+    number,
+    {
+      resolve: (result: { ok: true; results: SearchResults } | { ok: false; error: string }) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   // Hook events currently dispatched to the worker and not yet settled, as a multiset. While the
   // worker handles a hook it may issue capability calls that round-trip to the host; those run inside
   // this in-flight set so a capability that re-fires the same event is short-circuited (HookManager's
@@ -56,6 +64,9 @@ export class PluginWorkerHost {
 
   // Worker-initiated capability calls currently running host-side, bounded by maxInFlightCaps.
   private inFlightCaps = 0;
+  // True once terminate() is called, so onExit can tell a deliberate kill (disable/enable-failure) from an
+  // unexpected worker crash — only the latter is logged as a warning.
+  private terminated = false;
 
   constructor(
     private readonly channel: PluginWorkerChannel,
@@ -79,6 +90,13 @@ export class PluginWorkerHost {
     // sees a thrown Error) instead of queuing host-side work — bounding the aggregate sendText/net.fetch/
     // storage load a single sandboxed plugin can trigger. Absent/undefined => no cap (legacy behavior).
     private readonly maxInFlightCaps?: number,
+    // Called when the worker sends `search-provider-register` (the plugin called ctx.registerSearchProvider),
+    // so the host can create a PluginSearchProvider and register it. Mirrors onHookSubscribe /
+    // onWebhookSubscribe for the search bridge. Absent => the host ignores the declaration (e.g. tests).
+    private readonly onSearchProviderRegister?: () => void,
+    // Called once after the worker exits (crash or terminate), after in-flight calls are drained, so the
+    // loader can release plugin-owned host resources (e.g. unregister a search provider the worker declared).
+    private readonly onExit?: (code: number, intentional: boolean) => void,
   ) {
     this.channel.onMessage(message => this.handleMessage(message));
     this.channel.onExit(code => this.handleExit(code));
@@ -184,6 +202,27 @@ export class PluginWorkerHost {
   }
 
   /**
+   * Dispatch a search query to a plugin that registered as a SearchProvider and await its result.
+   * Bounded by `timeoutMs`: a slow/wedged worker resolves ok:false (the caller throws) rather than
+   * hanging the /search request. A mid-search worker crash is drained to ok:false in handleExit.
+   */
+  dispatchSearch(options: {
+    query: SearchQuery;
+    timeoutMs: number;
+  }): Promise<{ ok: true; results: SearchResults } | { ok: false; error: string }> {
+    if (this.dead) return Promise.resolve({ ok: false, error: 'plugin worker is no longer running' });
+    const id = this.nextId++;
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        this.searchPending.delete(id);
+        resolve({ ok: false, error: 'search timed out' });
+      }, options.timeoutMs);
+      this.searchPending.set(id, { resolve, timer });
+      this.channel.postMessage({ kind: 'search', id, query: options.query });
+    });
+  }
+
+  /**
    * Load the plugin module in the worker; resolves once it reports `ready`, rejects if it errors.
    * When `timeoutMs` is given, a worker that never reports ready rejects the call (the caller then
    * tears the worker down) so a wedged module load can't hang enable forever.
@@ -257,6 +296,7 @@ export class PluginWorkerHost {
 
   /** Tear the worker down. */
   terminate(): Promise<void> {
+    this.terminated = true;
     return this.channel.terminate();
   }
 
@@ -328,6 +368,18 @@ export class PluginWorkerHost {
         this.healthPending.delete(message.id);
         clearTimeout(waiter.timer);
         waiter.resolve({ healthy: message.healthy, message: message.message });
+        break;
+      }
+      case 'search-provider-register':
+        this.onSearchProviderRegister?.();
+        break;
+      case 'search-result': {
+        const waiter = this.searchPending.get(message.id);
+        if (!waiter) return;
+        this.searchPending.delete(message.id);
+        clearTimeout(waiter.timer);
+        if (message.ok) waiter.resolve({ ok: true, results: message.results });
+        else waiter.resolve({ ok: false, error: message.error });
         break;
       }
     }
@@ -403,6 +455,14 @@ export class PluginWorkerHost {
       resolve({ ok: false, status: 502 });
     });
     this.webhookPending.clear();
+    // Drain in-flight searches: a mid-query worker crash must reject (ok:false) so the /search caller
+    // gets an error instead of waiting the full timeout for a worker that is already dead.
+    this.searchPending.forEach(({ resolve, timer }) => {
+      clearTimeout(timer);
+      resolve({ ok: false, error: 'plugin worker exited' });
+    });
+    this.searchPending.clear();
+    this.onExit?.(code, this.terminated);
   }
 
   private drain<T>(waiters: T[], fn: (w: T) => void): void {

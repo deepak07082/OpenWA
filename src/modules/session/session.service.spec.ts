@@ -1833,7 +1833,7 @@ describe('SessionService', () => {
           driverError: { code: 'SQLITE_CONSTRAINT_UNIQUE', message: 'UNIQUE constraint failed' },
         }); // re-fire
 
-      const msg = {
+      const msg: IncomingMessage = {
         id: 'wa-1',
         from: 'peer@c.us',
         to: 'me@c.us',
@@ -1913,6 +1913,107 @@ describe('SessionService', () => {
         expect(qb.orIgnore).toHaveBeenCalled();
         expect(execute).toHaveBeenCalled();
         expect(messageRepository.save).not.toHaveBeenCalled(); // no longer the throwing path
+      });
+    });
+
+    // ── persistHistoryMessages STORE_EPHEMERAL_MESSAGES guard ────────
+    describe('persistHistoryMessages ephemeral guard', () => {
+      const setupBulkQb = () => {
+        const execute = jest.fn().mockResolvedValue({ identifiers: [] });
+        const qb = {
+          insert: jest.fn().mockReturnThis(),
+          values: jest.fn().mockReturnThis(),
+          orIgnore: jest.fn().mockReturnThis(),
+          execute,
+        };
+        (messageRepository.createQueryBuilder as jest.Mock) = jest.fn().mockReturnValue(qb);
+        (messageRepository.find as jest.Mock).mockResolvedValue([]);
+        (messageRepository.create as jest.Mock).mockImplementation((data: Record<string, unknown>) => ({ ...data }));
+        return { qb, execute };
+      };
+
+      it('skips a disappearing history message when STORE_EPHEMERAL_MESSAGES=false', async () => {
+        process.env.STORE_EPHEMERAL_MESSAGES = 'false';
+        const callbacks = await startAndCaptureCallbacks();
+        const { qb, execute } = setupBulkQb();
+
+        callbacks.onHistoryMessages?.([
+          {
+            id: 'h-eph',
+            from: 'peer@c.us',
+            to: 'me@c.us',
+            chatId: 'peer@c.us',
+            body: 'vanishing',
+            type: 'text',
+            timestamp: 1,
+            fromMe: false,
+            isGroup: false,
+            ephemeralDuration: 86400,
+          },
+        ]);
+        await flush();
+
+        // The guard dropped the only message before de-dup, so the bulk insert was never reached.
+        expect(qb.values).not.toHaveBeenCalled();
+        expect(execute).not.toHaveBeenCalled();
+        delete process.env.STORE_EPHEMERAL_MESSAGES;
+      });
+
+      it('still persists a disappearing history message when STORE_EPHEMERAL_MESSAGES is unset (default)', async () => {
+        delete process.env.STORE_EPHEMERAL_MESSAGES;
+        const callbacks = await startAndCaptureCallbacks();
+        const { qb } = setupBulkQb();
+
+        callbacks.onHistoryMessages?.([
+          {
+            id: 'h-eph-default',
+            from: 'peer@c.us',
+            to: 'me@c.us',
+            chatId: 'peer@c.us',
+            body: 'vanishing',
+            type: 'text',
+            timestamp: 1,
+            fromMe: false,
+            isGroup: false,
+            ephemeralDuration: 86400,
+          },
+        ]);
+        await flush();
+
+        expect(qb.values).toHaveBeenCalledTimes(1);
+        const calls = qb.values.mock.calls as unknown[][];
+        const insertedRows = calls[0][0] as { waMessageId: string }[];
+        expect(insertedRows).toHaveLength(1);
+        expect(insertedRows[0].waMessageId).toBe('h-eph-default');
+      });
+
+      it('persists a non-disappearing history message even with STORE_EPHEMERAL_MESSAGES=false', async () => {
+        process.env.STORE_EPHEMERAL_MESSAGES = 'false';
+        const callbacks = await startAndCaptureCallbacks();
+        const { qb } = setupBulkQb();
+
+        callbacks.onHistoryMessages?.([
+          {
+            id: 'h-normal',
+            from: 'peer@c.us',
+            to: 'me@c.us',
+            chatId: 'peer@c.us',
+            body: 'stays',
+            type: 'text',
+            timestamp: 1,
+            fromMe: false,
+            isGroup: false,
+            // no ephemeralDuration — a regular chat message must never be dropped.
+          },
+        ]);
+        await flush();
+
+        expect(qb.values).toHaveBeenCalledTimes(1);
+        const calls = qb.values.mock.calls as unknown[][];
+        const insertedRows = calls[0][0] as { waMessageId: string }[];
+        expect(insertedRows).toHaveLength(1);
+        expect(insertedRows[0].waMessageId).toBe('h-normal');
+        delete process.env.STORE_EPHEMERAL_MESSAGES;
       });
     });
   });

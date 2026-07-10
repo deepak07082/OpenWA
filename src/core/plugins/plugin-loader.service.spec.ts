@@ -121,6 +121,10 @@ import { ModuleRef } from '@nestjs/core';
 import { HookManager } from '../hooks';
 import { PluginStorageService } from './plugin-storage.service';
 import { IPlugin, PluginContext, PluginManifest, PluginStatus, PluginType } from './plugin.interfaces';
+import { SearchProviderRegistry } from '../../modules/search/search-provider.registry';
+import { WorkerThreadChannel } from './sandbox/worker-thread-channel';
+import { PluginWorkerHost } from './sandbox/plugin-worker-host';
+import { PluginLogLevel } from './sandbox/protocol';
 
 describe('PluginLoaderService.registerBuiltInPlugin config', () => {
   function makeLoader(): PluginLoaderService {
@@ -570,5 +574,218 @@ describe('PluginLoaderService.dispatchWebhookForInstance config delivery', () =>
     expect(dispatchWebhook).toHaveBeenCalledWith(
       expect.objectContaining({ config: { baseUrl: 'https://tenant1', accountId: 1 } }),
     );
+  });
+});
+
+describe('PluginLoaderService — search-provider wiring', () => {
+  function makeLoader(moduleRefGet: jest.Mock): PluginLoaderService {
+    const configService = { get: jest.fn().mockReturnValue(undefined) } as unknown as ConfigService;
+    const pluginStorage = {
+      getPluginEntry: jest.fn().mockReturnValue(undefined),
+      setPluginEntry: jest.fn(),
+      setPluginStatus: jest.fn(),
+      getPluginConfig: jest.fn().mockReturnValue(null),
+      getPluginSessions: jest.fn().mockReturnValue(undefined),
+      getPluginSessionConfig: jest.fn().mockReturnValue(undefined),
+      createPluginStorage: jest
+        .fn()
+        .mockReturnValue({ get: jest.fn(), set: jest.fn(), delete: jest.fn(), list: jest.fn() }),
+    } as unknown as PluginStorageService;
+    return new PluginLoaderService(configService, new HookManager(), pluginStorage, {
+      get: moduleRefGet,
+    } as unknown as ModuleRef);
+  }
+
+  it('getSearchRegistry returns the registry when ModuleRef has it', () => {
+    const registry = new SearchProviderRegistry();
+    const loader = makeLoader(jest.fn().mockReturnValue(registry));
+    expect((loader as unknown as { getSearchRegistry: () => unknown }).getSearchRegistry()).toBe(registry);
+  });
+
+  it('getSearchRegistry returns undefined when ModuleRef has no registry (search disabled)', () => {
+    const loader = makeLoader(
+      jest.fn().mockImplementation(() => {
+        throw new Error('not found');
+      }),
+    );
+    expect((loader as unknown as { getSearchRegistry: () => unknown }).getSearchRegistry()).toBeUndefined();
+  });
+
+  it('disablePlugin unregisters the plugin’s search-provider entry', async () => {
+    const registry = new SearchProviderRegistry();
+    registry.register({ id: 'plugin:disable-test', label: 'p', search: jest.fn(), health: jest.fn() });
+    const loader = makeLoader(jest.fn().mockReturnValue(registry));
+    const manifest: PluginManifest = {
+      id: 'disable-test',
+      name: 'Disable Test',
+      version: '1.0.0',
+      type: PluginType.EXTENSION,
+      main: 'index.js',
+    };
+    loader.registerBuiltInPlugin(manifest, {});
+    await loader.enablePlugin('disable-test'); // builtIn → enableInProcess, status→ENABLED
+    expect(registry.list().map(p => p.id)).toContain('plugin:disable-test');
+
+    await loader.disablePlugin('disable-test');
+
+    expect(registry.list().map(p => p.id)).not.toContain('plugin:disable-test');
+  });
+});
+
+describe('PluginLoaderService — search-provider enable-failure cleanup', () => {
+  jest.setTimeout(30000);
+  let tmpDir: string;
+  const BOOTSTRAP = path.resolve(__dirname, 'sandbox/worker-bootstrap.ts');
+  const TS_NODE_OPTS = JSON.stringify({
+    module: 'commonjs',
+    moduleResolution: 'node',
+    resolvePackageJsonExports: false,
+  });
+
+  // Runs the REAL worker (ts-node) instead of the compiled dist bootstrap, so enableSandboxed
+  // exercises its true load/lifecycle/catch path with a live worker thread.
+  class RealWorkerLoader extends PluginLoaderService {
+    protected createSandboxHost(
+      capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
+      onHookSubscribe?: (event: string, priority?: number) => void,
+      onWebhookSubscribe?: (route: string) => void,
+      onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
+      runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
+      onSearchProviderRegister?: () => void,
+    ): PluginWorkerHost {
+      return new PluginWorkerHost(
+        new WorkerThreadChannel({
+          workerEntry: BOOTSTRAP,
+          execArgv: ['-r', 'ts-node/register/transpile-only'],
+          env: { ...process.env, TS_NODE_COMPILER_OPTIONS: TS_NODE_OPTS },
+        }),
+        capDispatcher,
+        onHookSubscribe,
+        onWebhookSubscribe,
+        onLog,
+        runWithHookGuard,
+        undefined,
+        onSearchProviderRegister,
+      );
+    }
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-search-ef-'));
+    fs.mkdirSync(path.join(tmpDir, 'rt'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'rt', 'manifest.json'),
+      JSON.stringify({ id: 'rt', name: 'RT', version: '1.0.0', type: 'EXTENSION', main: 'index.cjs' }),
+    );
+    // Fixture: register a search provider, THEN throw in onEnable — so the host has received
+    // search-provider-register (and activated the provider in auto mode) before enable fails.
+    fs.writeFileSync(
+      path.join(tmpDir, 'rt', 'index.cjs'),
+      "module.exports = class { async onEnable(ctx) { ctx.registerSearchProvider(async () => ({ hits: [], total: 0, tookMs: 1, provider: 'plugin:rt' })); throw new Error('onEnable failed'); } };",
+    );
+  });
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  it('unregisters the search provider when enable fails after registration (no dead active provider)', async () => {
+    const registry = new SearchProviderRegistry();
+    registry.register({ id: 'builtin-fts', label: 'b', search: jest.fn(), health: jest.fn() });
+    const config = {
+      get: (k: string) =>
+        k === 'search.provider' ? 'auto' : k === 'plugins.dir' || k === 'dataDir' ? tmpDir : undefined,
+    } as unknown as ConfigService;
+    const storage = new PluginStorageService(config);
+    const loader = new RealWorkerLoader(config, new HookManager(), storage, {
+      get: () => registry,
+    } as unknown as ModuleRef);
+
+    loader.loadPlugin(path.join(tmpDir, 'rt'));
+    await expect(loader.enablePlugin('rt')).rejects.toThrow('onEnable failed');
+
+    // Registered mid-onEnable, then onEnable threw → the catch must unregister the dead provider.
+    expect(registry.list().map(p => p.id)).not.toContain('plugin:rt');
+    expect(registry.active()?.id).toBe('builtin-fts');
+  });
+});
+
+describe('PluginLoaderService — search-provider worker-crash fallback', () => {
+  jest.setTimeout(30000);
+  let tmpDir: string;
+  const BOOTSTRAP = path.resolve(__dirname, 'sandbox/worker-bootstrap.ts');
+  const TS_NODE_OPTS = JSON.stringify({
+    module: 'commonjs',
+    moduleResolution: 'node',
+    resolvePackageJsonExports: false,
+  });
+
+  // Real ts-node worker (so enableSandboxed runs its true path) that captures the host so the test can
+  // crash it.
+  class CapturingLoader extends PluginLoaderService {
+    lastHost?: PluginWorkerHost;
+    protected createSandboxHost(
+      capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
+      onHookSubscribe?: (event: string, priority?: number) => void,
+      onWebhookSubscribe?: (route: string) => void,
+      onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
+      runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
+      onSearchProviderRegister?: () => void,
+      onWorkerExit?: (code: number, intentional: boolean) => void,
+    ): PluginWorkerHost {
+      const host = new PluginWorkerHost(
+        new WorkerThreadChannel({
+          workerEntry: BOOTSTRAP,
+          execArgv: ['-r', 'ts-node/register/transpile-only'],
+          env: { ...process.env, TS_NODE_COMPILER_OPTIONS: TS_NODE_OPTS },
+        }),
+        capDispatcher,
+        onHookSubscribe,
+        onWebhookSubscribe,
+        onLog,
+        runWithHookGuard,
+        undefined,
+        onSearchProviderRegister,
+        onWorkerExit,
+      );
+      this.lastHost = host;
+      return host;
+    }
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-search-crash-'));
+    fs.mkdirSync(path.join(tmpDir, 'ok'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'ok', 'manifest.json'),
+      JSON.stringify({ id: 'ok', name: 'OK', version: '1.0.0', type: 'EXTENSION', main: 'index.cjs' }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ok', 'index.cjs'),
+      "module.exports = class { async onEnable(ctx) { ctx.registerSearchProvider(async () => ({ hits: [], total: 0, tookMs: 1, provider: 'plugin:ok' })); } };",
+    );
+  });
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  it('falls back to builtin-fts when the plugin worker crashes after a successful enable', async () => {
+    const registry = new SearchProviderRegistry();
+    registry.register({ id: 'builtin-fts', label: 'b', search: jest.fn(), health: jest.fn() });
+    const config = {
+      get: (k: string) =>
+        k === 'search.provider' ? 'auto' : k === 'plugins.dir' || k === 'dataDir' ? tmpDir : undefined,
+    } as unknown as ConfigService;
+    const storage = new PluginStorageService(config);
+    const loader = new CapturingLoader(config, new HookManager(), storage, {
+      get: () => registry,
+    } as unknown as ModuleRef);
+
+    loader.loadPlugin(path.join(tmpDir, 'ok'));
+    await loader.enablePlugin('ok'); // registers + setActive -> active = plugin:ok
+    expect(registry.active()?.id).toBe('plugin:ok');
+
+    // Worker crashes (unexpected exit) — terminate() emits the worker 'exit' event -> handleExit -> onWorkerExit.
+    await loader.lastHost!.terminate();
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(registry.list().map(p => p.id)).not.toContain('plugin:ok');
+    expect(registry.active()?.id).toBe('builtin-fts'); // fell back, not pinned to the dead plugin
   });
 });

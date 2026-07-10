@@ -25,6 +25,7 @@ import {
   PluginType,
   PluginLogger,
   validateIngressManifest,
+  warnUnauthenticatedIngressRoutes,
 } from './plugin.interfaces';
 import { effectiveNetAllow, isNetHostAllowed, performPluginFetch } from './plugin-net';
 import { PluginStorageService } from './plugin-storage.service';
@@ -36,6 +37,7 @@ import { PluginLogLevel } from './sandbox/protocol';
 import { buildConversationSendFacade, ConversationMediaType } from './conversation-send-facade';
 import { shouldDispatchToPlugin } from './handover-gate';
 import { makeOnWebhookSubscribe } from './webhook-subscribe.util';
+import { registerPluginSearchProvider, unregisterPluginSearchProvider } from './search-provider-registration.util';
 import { INGRESS_DISPATCH_TIMEOUT_MS } from '../../modules/integration/integration.constants';
 import type { MessageService } from '../../modules/message/message.service';
 import type { SessionService } from '../../modules/session/session.service';
@@ -43,6 +45,7 @@ import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.in
 import type { ConversationMappingService } from '../../modules/integration/conversation-mapping.service';
 import type { PluginInstanceService } from '../../modules/integration/plugin-instance.service';
 import type { IngressJobData } from '../../modules/queue/processors/ingress.processor';
+import type { SearchProviderRegistry } from '../../modules/search/search-provider.registry';
 
 /** Default per-plugin heap cap for the sandbox worker; an OOM terminates the worker, not the host. */
 const SANDBOX_MAX_OLD_GEN_MB = 256;
@@ -50,6 +53,8 @@ const SANDBOX_MAX_OLD_GEN_MB = 256;
 const SANDBOX_HOOK_TIMEOUT_MS = 5000;
 /** A sandboxed plugin's healthCheck must answer within this, else it's reported unhealthy (not hung). */
 const SANDBOX_HEALTH_TIMEOUT_MS = 5000;
+/** A sandboxed plugin's search handler must answer within this, else /search fails fast (not hung). */
+const SANDBOX_SEARCH_TIMEOUT_MS = 10000;
 /**
  * A sandboxed plugin's load()/onLoad/onEnable/onDisable must complete within this, else the worker is
  * torn down and the operation fails — a wedged lifecycle can't hang the enable/disable request (and
@@ -245,6 +250,11 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     // load and become provisionable. No-op for plugins that declare no ingress.
     validateIngressManifest(manifest);
 
+    // Surface a loud warning for any ingress route that skips signature verification — a scheme:'none'
+    // route is a fully-unauthenticated public endpoint that can trigger WhatsApp sends. Additive (a
+    // warning, not a refusal) so a legit scheme:'none' deployment still boots.
+    warnUnauthenticatedIngressRoutes(manifest, this.logger);
+
     // Check if plugin already loaded
     if (this.plugins.has(manifest.id)) {
       throw new Error(`Plugin ${manifest.id} is already loaded`);
@@ -417,6 +427,8 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
 
       // Unregister all hooks for this plugin
       this.hookManager.unregisterPlugin(pluginId);
+      // Drop the plugin's search-provider entry (if any) so queries don't route to a terminated worker.
+      unregisterPluginSearchProvider(this.getSearchRegistry(), pluginId);
 
       plugin.status = PluginStatus.DISABLED;
 
@@ -679,6 +691,23 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Resolve the SearchProviderRegistry lazily — search is conditionally loaded (SEARCH_ENABLED=false omits
+   * SearchModule), so the registry may not be registered. Mirrors the lazy-require pattern for
+   * MessageService/SessionService to avoid a static module edge and a DI cycle. Returns undefined when
+   * search is disabled, so the loader can no-op search-provider registration without throwing.
+   */
+  private getSearchRegistry(): SearchProviderRegistry | undefined {
+    try {
+      const mod =
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('../../modules/search/search-provider.registry') as typeof import('../../modules/search/search-provider.registry');
+      return this.moduleRef.get(mod.SearchProviderRegistry, { strict: false });
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Enforce a plugin's declared manifest permissions at the capability boundary. A plugin may only
    * use a capability whose permission string it declares in `manifest.permissions`; anything else
    * (including a manifest with no permissions) is denied. Runs first in each capability verb so a
@@ -753,6 +782,8 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     onWebhookSubscribe?: (route: string) => void,
     onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
     runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
+    onSearchProviderRegister?: () => void,
+    onWorkerExit?: (code: number, intentional: boolean) => void,
   ): PluginWorkerHost {
     const workerEntry = path.join(__dirname, 'sandbox', 'worker-bootstrap.js');
     return new PluginWorkerHost(
@@ -768,6 +799,8 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       onLog,
       runWithHookGuard,
       SANDBOX_MAX_INFLIGHT_CAPS,
+      onSearchProviderRegister,
+      onWorkerExit,
     );
   }
 
@@ -918,6 +951,41 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       else context.logger[level](message, meta);
     };
 
+    // When the worker declares itself a search provider (ctx.registerSearchProvider →
+    // search-provider-register), register a PluginSearchProvider in the SearchProviderRegistry. The host
+    // is in sandboxHosts by the time registration fires (during onLoad/onEnable), so look it up lazily
+    // like onHookSubscribe. Search disabled (no registry, or SEARCH_PROVIDER=none) → the util skips.
+    const onSearchProviderRegister = (): void => {
+      const liveHost = this.sandboxHosts.get(pluginId);
+      if (!liveHost) return;
+      registerPluginSearchProvider({
+        pluginId,
+        label: `${plugin.manifest.name} (plugin)`,
+        transport: liveHost,
+        timeoutMs: SANDBOX_SEARCH_TIMEOUT_MS,
+        registry: this.getSearchRegistry(),
+        mode: this.configService.get<string>('search.provider', 'auto'),
+      });
+    };
+
+    // A worker that crashes AFTER a successful enable is otherwise invisible to the loader (handleExit only
+    // drains in-flight calls). Drop the plugin's search-provider entry so the registry falls back to
+    // builtin-fts instead of routing every /search to a dead worker (auto mode would otherwise pin the dead
+    // provider ACTIVE). Mirrors the enable-failure cleanup. Broader crash-lifecycle cleanup (status, hooks)
+    // is a pre-existing gap for all bridges and out of scope here.
+    const onWorkerExit = (code: number, intentional: boolean): void => {
+      // Always release the search-provider slot so the registry can fall back to builtin-fts. On a crash
+      // this is the only cleanup; on a deliberate disable/enable-failure the explicit unregister already
+      // ran, making this a harmless no-op.
+      unregisterPluginSearchProvider(this.getSearchRegistry(), pluginId);
+      if (intentional) return; // routine disable/enable-failure already logged and expected
+      this.logger.warn(`Sandboxed plugin ${pluginId} worker exited unexpectedly (code ${code})`, {
+        pluginId,
+        code,
+        action: 'sandbox_worker_exit',
+      });
+    };
+
     const host = this.createSandboxHost(
       (verb, args) => dispatchCapabilityVerb(context, verb, args),
       onHookSubscribe,
@@ -926,6 +994,8 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       // Re-establish the in-flight hook context for worker-initiated capability calls, so a sandboxed
       // plugin that sends from within a send hook can't loop the event back into itself unboundedly.
       (events, run) => this.hookManager.runInFlight(events as HookEvent[], run),
+      onSearchProviderRegister,
+      onWorkerExit,
     );
     this.sandboxHosts.set(pluginId, host);
     try {
@@ -934,6 +1004,10 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       await host.runLifecycle('onEnable', SANDBOX_LIFECYCLE_TIMEOUT_MS);
     } catch (error) {
       this.sandboxHosts.delete(pluginId);
+      // Drop a search provider registered mid-onEnable before the failure: without this, a plugin that
+      // registers then throws leaves a dead provider as the ACTIVE registry entry in auto mode, so every
+      // /search routes to a terminated worker → outage. Mirrors disablePlugin's cleanup.
+      unregisterPluginSearchProvider(this.getSearchRegistry(), pluginId);
       await host.terminate().catch(() => undefined);
       throw error;
     }

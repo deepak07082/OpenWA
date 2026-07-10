@@ -43,6 +43,7 @@ import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error'
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
+import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import {
   GroupChat,
@@ -364,7 +365,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           if (proxyLaunch.socksAuthUnsupported) {
             this.logger.warn(
               `Proxy for session ${this.config.sessionId} has credentials on a SOCKS proxy, but Chromium ` +
-                `cannot authenticate SOCKS proxies. Use an IP-authorized proxy or an HTTP/HTTPS proxy instead.`,
+              `cannot authenticate SOCKS proxies. Use an IP-authorized proxy or an HTTP/HTTPS proxy instead.`,
             );
           }
           this.logger.log(`Using proxy: ${proxyLaunch.serverArg}`);
@@ -923,7 +924,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           // (#583 R3). Fire-and-forget: resolution (and the send) must never block/fail on the write.
           void this.config.lidMappingStore
             ?.remember(userPart(wid), userPart(chatId), this.config.sessionId)
-            ?.catch(() => {});
+            ?.catch(() => { });
         }
         return wid;
       }
@@ -991,6 +992,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     extraOptions?: { sendAudioAsVoice?: boolean },
   ): Promise<MessageResult> {
     this.ensureReady();
+    this.ensureNotChannelRecipient(chatId);
 
     let messageMedia: MessageMedia;
 
@@ -1146,6 +1148,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.ensureReady();
+    // Sticker has its own send path (sendMediaAsSticker), not the sendMediaMessage funnel, but it
+    // hits the same channel crash: for a channel wwjs drops the sticker form and runs processMediaData
+    // with sendToChannel, which still ends at msg.avParams() (Utils.js:518). Guard it too (#673).
+    this.ensureNotChannelRecipient(chatId);
     let messageMedia: MessageMedia;
 
     if (typeof media.data === 'string') {
@@ -1917,5 +1923,14 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       }
     }
     throw error;
+  }
+
+  private ensureNotChannelRecipient(chatId: string): void {
+    // whatsapp-web.js crashes building a channel media message (`msg.avParams is not a function`,
+    // upstream wwebjs#201823 — WA Web removed Msg.avParams). Text→channel works; media does not.
+    // Fail fast with a typed 501 instead of surfacing the raw TypeError as a 500 (#673).
+    if (isChannelJid(chatId)) {
+      throw new ChannelMediaNotSupportedError();
+    }
   }
 }

@@ -20,6 +20,22 @@ export class SsrfBlockedError extends Error {
 export const SSRF_BLOCKED_CLIENT_MESSAGE = 'Destination address is not allowed';
 
 /**
+ * Map an error to a client/surfaced message, redacting SSRF detail. An `SsrfBlockedError`'s message
+ * names the resolved internal IP ("… resolves to a blocked internal address: 10.0.0.5") — a recon /
+ * metadata-service probe oracle when surfaced verbatim to an HTTP response, a persisted DLQ row, or a
+ * hook payload. Log the full detail server-side (when a `logger` is supplied) and return the generic
+ * {@link SSRF_BLOCKED_CLIENT_MESSAGE} instead; any other error passes through verbatim so genuine
+ * receiver failures (5xx, timeout, bad-zip) keep their actionable text.
+ */
+export function redactSsrfError(error: unknown, logger?: { warn: (message: string) => void }, site?: string): string {
+  if (error instanceof SsrfBlockedError) {
+    logger?.warn(`SSRF guard blocked ${site ?? 'an outbound fetch'}: ${error.message}`);
+    return SSRF_BLOCKED_CLIENT_MESSAGE;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
  * Outbound webhook SSRF protection. Default ON; disable only with an explicit
  * WEBHOOK_SSRF_PROTECT=false (e.g. a closed network that delivers to internal sidecars — prefer
  * the SSRF_ALLOWED_HOSTS escape-hatch instead of disabling protection wholesale).
@@ -169,6 +185,20 @@ export function isBlockedAddress(ip: string): boolean {
         hextets[3] === 0 &&
         hextets[4] === 0xffff &&
         hextets[5] === 0
+      ) {
+        return isBlockedAddress(hextetsToV4(hextets[6], hextets[7]));
+      }
+      // Fully-expanded IPv4-mapped (::ffff:0:0/96 → 0:0:0:0:0:ffff:X:X): the compressed "::ffff:"
+      // form is caught by the prefix check above, but the fully-expanded literal bypasses it.
+      // Distinct from IPv4-compat (idx5 has no 0xffff) and RFC6052 (0xffff at idx4, not idx5).
+      // Classify by the embedded IPv4 (public stays allowed).
+      if (
+        hextets[0] === 0 &&
+        hextets[1] === 0 &&
+        hextets[2] === 0 &&
+        hextets[3] === 0 &&
+        hextets[4] === 0 &&
+        hextets[5] === 0xffff
       ) {
         return isBlockedAddress(hextetsToV4(hextets[6], hextets[7]));
       }
